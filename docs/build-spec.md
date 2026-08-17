@@ -231,7 +231,8 @@ CREATE TABLE rejects (
 -- The work item. Holds both a chief-of-staff request and a dev item; see §5.1.
 CREATE TABLE queue (
   id             INTEGER PRIMARY KEY,
-  slug           TEXT NOT NULL UNIQUE,   -- == branch name, stable across the lifecycle
+  host           TEXT NOT NULL DEFAULT 'default',  -- which workspace; a NAME, never a path (§5.3)
+  slug           TEXT NOT NULL,          -- == branch name, stable across the lifecycle
   event_id       INTEGER REFERENCES events(id),   -- nullable: operator-captured items have none
   kind           TEXT NOT NULL,          -- decision|dev-item|friction|opportunity|report
   title          TEXT NOT NULL,
@@ -257,11 +258,12 @@ CREATE TABLE queue (
   CHECK (kind IN ('decision','dev-item','friction','opportunity','report')),
   CHECK (timing IN ('hourly','overnight')),
   CHECK (dispatch IN ('now','next-cycle','manual')),
-  CHECK (severity IS NULL OR severity IN ('blocker','high','medium','low'))
+  CHECK (severity IS NULL OR severity IN ('blocker','high','medium','low')),
+  UNIQUE (host, slug)     -- slugs are unique WITHIN a workspace, not globally (§5.3)
 );
 
-CREATE INDEX idx_queue_status ON queue (status, decide_by);
-CREATE INDEX idx_queue_timing ON queue (timing, status);
+CREATE INDEX idx_queue_status ON queue (host, status, decide_by);
+CREATE INDEX idx_queue_timing ON queue (host, timing, status);
 
 CREATE TABLE commitments (
   id              INTEGER PRIMARY KEY,
@@ -314,6 +316,7 @@ CREATE TABLE outbox (
 
 CREATE TABLE runs (
   id           INTEGER PRIMARY KEY,
+  host         TEXT NOT NULL DEFAULT 'default',  -- which workspace this run operated against
   operation    TEXT NOT NULL,
   started_at   TEXT NOT NULL,
   finished_at  TEXT,
@@ -420,6 +423,33 @@ failure this makes visible.
 
 **`cb-distill` and `cb-ingest` already do this work against markdown.** The migration keeps them
 running rather than replacing them.
+
+### 5.3 More than one workspace
+
+`queue` and `runs` carry a `host`. Nothing else does, and the asymmetry is the point: an item and a run
+belong to a workspace, while an event, a commitment and an entity belong to the *operator*. A Gmail
+message is not the property of a vault, and a promise made to a colleague does not stop being owed
+because it was extracted while pointed at a different directory.
+
+**The column stores a name, never a path.** `vault`, `cerebro-test` — resolved to a root through config
+at use time. This is the one lesson the current system already paid for: `~/.cerebro/tasks/<slug>/landed`
+stores a workspace-relative path, and archiving 281 reports meant rewriting 281 stored markers to keep
+`cb-distill --queue` resolving. Paths in state make a move expensive. Names do not.
+
+**`slug` is unique within a host, not globally.** Two workspaces can each hold an item called
+`fix-the-thing` without either being wrong, so the constraint is `UNIQUE (host, slug)` and the hot
+indexes lead with `host`.
+
+This does not commit the build to multi-workspace operation. Today `CB_VAULT` is process-global, read at
+call time, so one process serves one workspace and every row lands with the same `host` — which is why
+the default exists and why the column costs nothing until it is wanted. What it buys is that wanting it
+later is a config change rather than a migration against live rows.
+
+Worth being clear about what is still *not* solved by the column: the scheduler. systemd unit names are
+fixed strings (`cerebro.timer`, `cerebro-intake.timer`, and four more), so running two instances at once
+needs template units — `cerebro@.service` with `EnvironmentFile=%h/.config/cerebro/%i.env` — and
+`projects.md` needs its host-specific rows lifted into a host overlay, because a plugin cache is
+read-only. Those are the real multi-instance blockers; the schema is just no longer one of them.
 
 ## 6. Component contracts
 
