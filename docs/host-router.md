@@ -12,6 +12,13 @@ the build spec (docs/build-spec.md) assumes an item already knows where it belon
 says how it finds out.
 
 > ## ⏸ Deferred — build one vault, keep the seams
+# Host router — deciding which workspace owns an item
+
+Design for the one v2 component with nothing behind it. Everything else in
+the build spec (docs/build-spec.md) assumes an item already knows where it belongs; this
+says how it finds out.
+
+> ## ⏸ Deferred — build one vault, keep the seams
 >
 > Kyle, 2026-08-17: *"Let's start with single vault while I am the single user on this system. As we
 > grow and move into potentially allowing multiple users access this may need to split into multiple
@@ -29,6 +36,29 @@ says how it finds out.
 >
 > **The trigger is multiple users, not vault count** — which matters, because multi-user is a bigger
 > change than multi-vault and hits different tables. See §7.
+>
+> ### And the cheaper answer may be that this is never built
+>
+> Kyle, 2026-08-17: *"Each vault could be separate claude instances with their own CLAUDE.md files and
+> operating rules rather than attempting to have Cerebro handle multiple vaults simultaneously."*
+>
+> That is very likely right, and it splits the problem along a seam this document does not use.
+> **There are two layers here and only one of them wants a router:**
+>
+> - **Operating rules — how an agent should behave in a given context.** Per-directory `CLAUDE.md`
+>   already does this and always has: `03 Resources/CLAUDE.md`, `Meetings/CLAUDE.md`,
+>   `02 Areas/development/CLAUDE.md`. An Ultron/annuity workspace and an Ironman/life workspace want
+>   genuinely different conventions and vocabulary, and nothing in this spec addresses that — `host` and
+>   `platform` say where data goes, not how to behave once you are there. Separate instances get it for
+>   free.
+> - **Operator surfaces — comms sweep, commitments, dispatch.** These stay single-instance regardless,
+>   for the reason in §4.2: one Gmail, one Slack, one Jira, one person. N instances sweeping the same
+>   mailbox extract the same promise N times and nudge N times, and no per-vault `CLAUDE.md` fixes that.
+>
+> So the likely end state is **separate instances for working context, one instance for the operator
+> layer** — and a host router is only needed if the operator layer itself has to fan work out across
+> workspaces. Do not unpark this document without first checking whether per-vault `CLAUDE.md` plus one
+> comms instance already covers the case. It probably does.
 
 Original framing, retained because the analysis holds whenever the split happens — Kyle, 2026-08-17:
 a vault dedicated to Protective on the Life project and a vault dedicated to the Annuity project,
@@ -190,8 +220,18 @@ read off the ticket.
 | `PML` | ironman | penn-mutual |
 | `PRU` | ironman | prudential |
 | `MCP` | ironman | lion-street / ffr / ppg |
-| `PA`, `PI` | ironman | *unconfirmed — see §6* |
-| `SD` | **neither** | platform bucket, not a carrier (`profile.md`) — always `unrouted` unless a host claims it explicitly |
+| `EJSD` | ironman | edj — Edward Jones **Insurance** Service Desk, the Life-side counterpart to `ASD` |
+| `PSD` | ironman | protective — Protective Service Desk |
+| `PA` | **neither** | **Platform Architecture** — internal, not a carrier |
+| `PI` | **neither** | **Porch Internal Initiatives** — internal, not a carrier |
+| `SD` | **neither** | **Software Development** — internal, not a carrier |
+| `ARCH` | ultron | **Annuity Architecture** — internal to the annuity platform |
+
+The last four route to a platform vault or to `unrouted`, never to a partner. Verified against live Jira
+2026-08-17 (`getVisibleJiraProjects`, 36 projects): **`PA` is Platform Architecture and `PI` is Porch
+Internal Initiatives.** Both were listed among the Life/carrier keys in `03 Resources/glossary.md`,
+which would have routed internal platform work to a carrier engagement; the glossary is corrected.
+`EJSD` and `PSD` were missing from the vault's key list entirely.
 
 ### 3.3 Properties
 
@@ -285,9 +325,15 @@ Named so nobody reads the router as more than it is:
 
 ## 6. Open questions
 
-1. **`PA` and `PI` are unconfirmed.** `03 Resources/glossary.md` lists them among Life/carrier keys
-   without naming the partner. `profile.md` mentions `PA` in a sprint context. Confirm before they are
-   in the table, or leave them `unrouted` — which is the safe default and costs only a surfaced item.
+1. ~~**`PA` and `PI` are unconfirmed.**~~ ✅ **Resolved 2026-08-17 against live Jira.** `PA` is Platform
+   Architecture, `PI` is Porch Internal Initiatives — neither is a carrier. The glossary said otherwise
+   and is corrected. Also found: `EJSD` and `PSD`, two Life-side service desks absent from the vault's
+   key list, and `ARCH` (Annuity Architecture) on the Ultron side.
+
+   Worth keeping as a method note rather than deleting: the vault's key list was wrong in three places
+   and incomplete in three more, and one `getVisibleJiraProjects` call settled all six. **The key table
+   is derivable from Jira and should be generated rather than hand-maintained** — a hand-written copy of
+   an authoritative list is a copy that drifts, which is what happened here.
 2. 🔴 **How does a `NW` item split between Nationwide-as-carrier and Nationwide Single Platform?**
    §1.1. The largest unsolved routing problem, and it generalises to any carrier that is also a direct
    installation. Needs a second signal — board, component, label — or those items stay `unrouted`.

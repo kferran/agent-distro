@@ -232,6 +232,7 @@ CREATE TABLE rejects (
 CREATE TABLE queue (
   id             INTEGER PRIMARY KEY,
   host           TEXT NOT NULL DEFAULT 'default',  -- which workspace; a NAME, never a path (§5.3)
+  platform       TEXT NOT NULL DEFAULT 'none',      -- which codebase: ultron|ironman|none (§5.1)
   slug           TEXT NOT NULL,          -- == branch name, stable across the lifecycle
   event_id       INTEGER REFERENCES events(id),   -- nullable: operator-captured items have none
   kind           TEXT NOT NULL,          -- decision|dev-item|friction|opportunity|report
@@ -259,6 +260,7 @@ CREATE TABLE queue (
   CHECK (timing IN ('hourly','overnight')),
   CHECK (dispatch IN ('now','next-cycle','manual')),
   CHECK (severity IS NULL OR severity IN ('blocker','high','medium','low')),
+  CHECK (platform IN ('ultron','ironman','none')),
   UNIQUE (host, slug)     -- slugs are unique WITHIN a workspace, not globally (§5.3)
 );
 
@@ -383,6 +385,26 @@ separate from `queued` because `cb-intake:109` claims on `queued` and only `queu
 rather than a status value.
 
 `decide_by` is `NOT NULL`. That is the single most load-bearing constraint in the table.
+
+**`platform` names the codebase the item touches — `ultron`, `ironman`, or `none`.** It is not a
+synonym for `host`, and it earns its place with a single vault, which is why it is here rather than
+deferred with the multi-workspace machinery in §5.3.
+
+Ultron (annuity) and Ironman (life) are *"separate codepaths, integrations, and submission flow"*
+(`03 Resources/glossary.md`), and the vault's knowledge tree already mirrors that split with parallel
+`03 Resources/ultron/` and `03 Resources/ironman/` trees — both of which, tellingly, carry a
+`capability-form-stamping.md`. The concept name collides while the codepath does not. So this column is
+what §6.7's archivist resolves a knowledge destination from: an Ironman finding must not be able to land
+in Ultron's tree because the path looked thematically right.
+
+`none` covers items that touch no codebase — a decision, a friction row, a piece of org work.
+
+⚠️ **`platform` cannot always be derived from the Jira key**, and the exception is documented rather
+than assumed: `NW` is Nationwide, which is both a carrier whose products flow through distributors and a
+direct Ironman installation ("Nationwide Single Platform"). One project key, two relationships. Those
+items need a component, label or board to disambiguate; absent one, the router leaves `platform`
+unresolved rather than guessing. Detail in
+the host router design (docs/host-router.md) §1.1.
 
 ### 5.2 One surface, and the lifecycle that runs on it
 
@@ -852,10 +874,11 @@ collapse. This is the 122-item overdue pile, described precisely.
 | 4 | Scribe + daily note render | Note renders; hand-edit inside markers survives as `## Reclaimed` + friction row; markdown image in a swept event is defanged on disk; deny list refuses every identity file |
 | 5 | Slack scout, triage rubric, entity clustering | Full sweep coverage; ranking stable across runs; same topic across sources clusters as one item |
 | 6 | **The `queue` migration** — `00 Inbox/` becomes a projection; `development/queue.md` and `development/items/` consolidated in | Every existing item lands with a legal status and a non-null `decide_by`; `cb-intake`, `cb-distill` and `cb-ingest` keep working against the rendered surface |
-| 7 | Chief of staff over Slack, dispatch + queue | Operator hands off a task from a phone |
-| 8 | Session hooks, brief injection via `hookSpecificOutput.additionalContext` | New sessions start oriented without manual briefing |
-| 9 | Jira scout | Assignment appears within one sweep, without double-claiming against `cb-reactive-intake` |
-| 10 | Friction review, weekly, opens PRs | System proposes its own improvements |
+| 7 | **Archivist digestion, propose-then-apply** — §6.7's knowledge sink | Prose lands in the right file after operator approval; a write whose `platform` mismatches the destination's declared scope is refused, not merged; the per-domain cap is enforced at write time rather than by convention |
+| 8 | Chief of staff over Slack, dispatch + queue | Operator hands off a task from a phone |
+| 9 | Session hooks, brief injection via `hookSpecificOutput.additionalContext` | New sessions start oriented without manual briefing |
+| 10 | Jira scout | Assignment appears within one sweep, without double-claiming against `cb-reactive-intake` |
+| 11 | Friction review, weekly, opens PRs | System proposes its own improvements |
 
 **Phase 1 deserves disproportionate effort.** Everything downstream assumes the registrar's guarantees
 hold, and there is nothing like it today.
@@ -882,7 +905,7 @@ current system for the least gain. It goes last.
 | Outbound sends to third parties | Changes the blast-radius category entirely |
 | A second alert channel | The failure it would address is upstream of delivery — §8.2 |
 
-Phase 10's friction reviewer must be **read-only** on the `friction` table and must never write to
+Phase 11's friction reviewer must be **read-only** on the `friction` table and must never write to
 the table it is evaluated against. Every proposal requires operator approval.
 
 ## 12. Conventions for the implementing agent
