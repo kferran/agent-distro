@@ -1,0 +1,26 @@
+# Runtime state never belongs in the distro. It lives in /opt/cerebro-state
+# or $CB_HOME (~/.cerebro) — see the spec, §4.1.
+*.db
+*.db-wal
+*.db-shm
+config.toml
+exports/
+logs/
+
+# Secrets. The spec calls for systemd credentials or a secrets manager rather
+# than a plaintext env file; this is belt-and-braces for local development.
+.env
+*.token
+credentials.json
+
+# OS and editor junk
+.DS_Store
+Thumbs.db
+*.swp
+*~
+.idea/
+.vscode/
+
+# Test scratch
+tmp/
+.bats-tmp/
