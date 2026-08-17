@@ -1,0 +1,308 @@
+#!/usr/bin/env bash
+# scripts/cerebro/cb-board — render the tracked board.md (spec §8 shape).
+# The attention area renders TWO counts (2026-08-01), never summed. "⚠ Needs a
+# decision" is the R12 open-decision set, cost-ordered: needs-input (an idling
+# agent burning wall clock) above blocked (M6). "📄 Reports to read" is
+# ready-for-review — a waitable PR, not a decision. One combined count buried 11
+# live questions inside 144 unread reports, which is 91% ingest backlog wearing
+# a judgment label. "🔁 Needs relaunch" (M6: an exhausted-and-still-wedged code
+# task) belongs to neither set — it is never entered in the decision log
+# (cb-watch:28 opens decisions for needs-input|blocked only) and burns no wall
+# clock, so it renders on its own line, omitted when empty like ℹ Auto-resumed.
+# "❓ No open question" (2026-08-04) is the same shape: a task classified
+# needs-input with nothing answerable on it — either no `gate:` was declared, so
+# _decision_for projects nothing, or the declared question is already answered and
+# sealed. The watcher thinks a human should look; there is no question to answer.
+# It is state-derived, clears itself, and is counted separately from "Needs a
+# decision" on purpose.
+# Then Running, Paused, Done, Failed.
+# The "ℹ Auto-resumed" FYI section arrives with M6/T31.
+#
+# VERIFY-MARKERS on a decision line. Every other field on that line was written
+# by the task about itself, so a dead worker's question reads exactly like a live
+# one. Between the slug and the state the board therefore renders what it
+# established itself (cb_decision_markers, classify.sh): `📨 asked & exited` when
+# the session is gone on a cb-ask'd question — the worker asked and exited
+# cleanly, so trust it — versus `⚰ no session` when it is gone on the watcher's
+# heuristic suspicion, which is a corpse; `⏳ <N>d` past
+# CB_DECISION_AGE_WARN_SECS; `🔀 pr <STATE>` when a PR is already open. They sit
+# before the gate parenthetical because gate strings run to several hundred
+# characters and a trailing marker would never be read.
+# Silence means NOT ESTABLISHED, never "fine": an alive-or-unreadable session, an
+# unparseable timestamp and a missing pr.state each render nothing, so a broken
+# probe degrades this board to what it printed yesterday rather than reassuring.
+set -euo pipefail
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"; source "$here/lib/paths.sh"; source "$here/lib/classify.sh"; source "$here/lib/xman.sh"
+: "${CB_VAULT:=$HOME/vault}"
+# R12: "⚠ Needs you" is a projection of the OPEN-DECISION SET (union across
+# tasks), not last-state-wins — so a decision the agent raised, that Kyle never
+# answered and the task then advanced past, is NOT silently masked. The set is
+# the union of each task's LOGGED open decisions (folded — catches the masked
+# ones, whatever the task's current state) and any LIVE needs-input/blocked not
+# yet logged (standalone board / pre-tick), deduped by content key.
+#
+# "Whatever the task's current state" is the anti-masking rule, and it is NOT a
+# licence to outlive the question: with nothing writing the matching `resolved`,
+# a decision the task shipped past stayed on the board forever (measured
+# 2026-07-31 — 66 open decisions, 51 of them already settled). The fold is now
+# taken through `open_decisions_live`, which drops a decision only on the task's
+# OWN terminal evidence and only where that evidence actually answers it —
+# a watcher heuristic dies on any terminal signal, a human-authored `declared`
+# question survives everything short of the work shipping. Anti-masking is
+# intact: the settlement test reads terminal evidence, never the state bucket.
+# The current
+# state still drives Running/Paused/Done/Failed — a task may render its current
+# state AND surface an open decision. The set is needs-input + blocked, and that
+# set is exactly what the "⚠ Needs a decision" headline counts — the split is a
+# rendering change, so the projection is unchanged. ready-for-review is a
+# waitable, not a decision, and now carries its own count. Cost order within the
+# set: needs-input, then blocked.
+needs_input=(); ready=(); blocked=(); relaunch=(); running=(); paused=(); done_list=(); failed=(); unclear=()
+# 2026-08-11 board reduction. Three of the six list sections were printing a
+# backlog rather than a queue — 398 of a 428-line render was Reports (259), Done
+# (98) and Failed (50), none of which is a thing to do today. They now render a
+# COUNT AND A POINTER instead of the items. The count is not optional: a section
+# that stopped listing 259 items and did not say "259" would hide the size of the
+# backlog, which is the one thing the long board was actually good at. Empty
+# sections are dropped; "⚠ Needs a decision" always renders, both because it is
+# the live-attention set and because it is then the anchor that proves the render
+# ran at all.
+done_sorted=(); failed_declined=0; failed_nopr=0
+CB_BOARD_DONE_SHOW="${CB_BOARD_DONE_SHOW:-10}"
+declare -A _seen
+_bucket_decision() {  # _bucket_decision <slug> <state> <gate> [markers]
+  # markers go BETWEEN the slug and the state parenthetical, one space apart. The
+  # concatenation is conditional so an empty marker string leaves the line
+  # byte-identical to the pre-marker board — no double space, no trailing space.
+  local m="${4:-}"; [ -n "$m" ] && m=" $m"
+  case "$2" in
+    needs-input) needs_input+=("$1$m (needs-input: $3)");;
+    blocked)     blocked+=("$1$m (blocked: $3)");;
+  esac
+}
+# One liveness-sampling epoch for the whole render: classify already resolves
+# liveness per task and the markers ask again, so without the memo this loop
+# would shell out to tmux + `ps -eo` twice per task. Closed right after the loop
+# — the trap covers the abort path, so a `set -e` exit mid-loop still removes the
+# epoch's scratch dir instead of leaving one behind on every failed render.
+trap cb_liveness_epoch_end EXIT
+cb_liveness_epoch_begin
+for td in "$CB_HOME"/tasks/*/; do
+  [ -d "$td" ] || continue; slug="$(basename "$td")"
+  st="$(classify "$td")"
+  # WHO is working it (lib/xman.sh). The board is where Kyle scans that, so the
+  # name rides the three live buckets: what's running, what's waiting, and whose
+  # report is up for reading. SUFFIXED, never spliced before the state
+  # parenthetical — the decision lines are asserted byte-exact in
+  # board-markers.bats and their gate strings run to hundreds of characters, so
+  # they are deliberately left alone.
+  # xman_read, not xman_name: rendering the board must not INVENT a name for a
+  # task that ran before names were persisted (its spawn announced a random one
+  # nothing recorded), and a read-only render must not write into 288 task dirs.
+  xm="$(xman_read "$slug" 2>/dev/null || true)"; [ -n "$xm" ] && xm=" · 🦸 $xm"
+  case "$st" in
+    ready-for-review) ready+=("$slug (ready-for-review)$xm");;
+    needs-relaunch) relaunch+=("$slug (needs manual relaunch)");;
+    running) running+=("$slug$xm");;
+    paused)  paused+=("$slug (paused)$xm");;   # R6: declared external wait — visible, not a wedge
+    # Done is capped at the most recent CB_BOARD_DONE_SHOW, so it needs a
+    # recency key — the glob is directory order, and "the last 10" off that
+    # would be an arbitrary 10 wearing the word "recent".
+    done)    done_list+=("$slug"); done_sorted+=("$(stat -c %Y "$td" 2>/dev/null || echo 0) $slug");;
+    # Failed prints a reason breakdown in place of the list. The split that
+    # matters is whether the work got as far as a PR: a DECLINED PR is a decision
+    # someone already made, everything else died before anyone looked.
+    failed)  failed+=("$slug")
+             if [ "$(cat "$td/pr.state" 2>/dev/null || true)" = DECLINED ]; then
+               failed_declined=$(( failed_declined + 1 ))
+             else
+               failed_nopr=$(( failed_nopr + 1 ))
+             fi;;
+  esac
+  # logged open decisions (folded) — surfaced regardless of the task's state
+  # bucket, MINUS the ones the task's own terminal evidence has settled
+  # (open_decisions_live; see classify.sh). Every still-open key is still marked
+  # `_seen`, settled or not, so the live-projection below cannot re-add one the
+  # settlement rule just excluded.
+  while IFS=$'\t' read -r dk dstate dgate; do
+    [ -n "$dk" ] || continue
+    _seen["$slug|$dk"]=1
+  done < <(open_decisions "$td")
+  # The age marker needs the open line's timestamp. `_open_decisions_aged` is
+  # this same set with that field already attached, but it re-enters
+  # open_decisions_live and so audits the log a third time per task; resolving
+  # the timestamp per RENDERED key is ~12 tiny awks instead of 165 greps.
+  while IFS=$'\t' read -r dk dstate dgate; do
+    [ -n "$dk" ] || continue
+    _bucket_decision "$slug" "$dstate" "$dgate" \
+      "$(cb_decision_markers "$td" "$dk" "$(cb_decision_open_ts "$td" "$dk")")"
+  done < <(open_decisions_live "$td")
+  # a live needs-input/blocked not yet in the log (pre-tick / standalone render).
+  # No logged open line means no timestamp, hence no age marker — the liveness
+  # and PR markers still apply.
+  #
+  # An EMPTY key is _decision_for declining to project (classify.sh): a code task
+  # with no gate signal — no `gate:`, no `gate_question:`, and a `current_task`
+  # whose vocabulary is progress or unrecognised — has no question, only a resume
+  # pointer. Those land on the "No open question" line below.
+  #
+  # THE SEAL APPLIES HERE TOO, and this path is the one that would have hidden a
+  # violation of it. It does not read the fold — it recomputes _decision_for and
+  # dedupes against `open_decisions`, which returns NOTHING for a sealed key. So a
+  # sealed key would render under "Needs a decision" while cb-digest (reading
+  # open_decisions_live) reads none: the same phantom relocated to the surface Kyle
+  # actually looks at, and unclearable by answering, because it is projected live
+  # rather than read from the log. classify.sh:106-114 names this class — a
+  # board-level test passes while the two views disagree.
+  #
+  # It fires on the ORDINARY answered-gate window, not an exotic one: cb-send
+  # writes the `resolved`, and until the conductor clears `gate:` the task still
+  # classifies needs-input on the same key.
+  if [ "$st" = "needs-input" ] || [ "$st" = "blocked" ]; then
+    IFS=$'\t' read -r dk dstate dgate <<<"$(_decision_for "$td" "$st")"
+    if [ -n "$dk" ] && ! _decision_sealed "$td" "$dk"; then
+      [ -n "${_seen[$slug|$dk]:-}" ] || \
+        _bucket_decision "$slug" "$dstate" "$dgate" "$(cb_decision_markers "$td" "$dk" "")"
+    else
+      # THE COMPENSATING SURFACE for a needs-input/blocked task that projects no
+      # decision. Neither state has a bucket in the `case` above — such a task
+      # reached this board ONLY through the decision projection — so without this
+      # line, suppressing the projection would make it render nowhere. For
+      # needs-input that would silently falsify the R13 rationale at
+      # classify.sh:796, which justifies classifying an unprovable state as
+      # needs-input precisely because it is "human-visible (board bucket +
+      # digest)". The commonest source is that arm: a live session, a manifest
+      # that has not moved and a quiet pane, which is a state nobody can
+      # establish — not a question anyone can answer.
+      #
+      # `blocked` IS included, deliberately. cb-watch:149 does route it through
+      # cb-remediate, but remediation only promotes to needs-relaunch (which has
+      # its own bucket) AT THE CAP — so a blocked task under the cap would sit
+      # invisible while the robot quietly retried. It renders in "Needs a
+      # decision" today, so a lower-cost line is strictly less noise than the
+      # status quo, not more.
+      #
+      # Deliberately NOT a decision. It is derived from the current
+      # classification and written nowhere, so it clears the instant the state
+      # changes and needs no `resolved` — it cannot become the phantom it
+      # replaces.
+      #
+      # TWO REASONS REACH HERE and the line says which. A sealed key means the
+      # question WAS answered and the conductor has not cleared its `gate:` yet —
+      # writing "no gate declared" there would be a lie about why the task is on
+      # the board, and a line that lies is worse than no line. The state is on the
+      # line too, so `blocked` never reads as a question awaiting an answer.
+      #
+      # No markers: the liveness glyph is keyed on the logged verb, and for the
+      # no-gate case there is no logged line by construction (cb_decision_markers
+      # renders nothing for an empty key, deliberately — unknown evidence, not a
+      # guess).
+      if [ -n "$dk" ]; then
+        unclear+=("$slug ($st at $(task_gate "$td" 2>/dev/null), answered — gate not cleared)")
+      else
+        unclear+=("$slug ($st at $(task_gate "$td" 2>/dev/null), no gate declared)")
+      fi
+    fi
+  fi
+done
+cb_liveness_epoch_end
+{
+  printf '## Board — %s\n\n' "$(date +%H:%M)"
+  # The headline counts EVERY stopped task, `unclear` included (2026-08-07, Kyle).
+  # It used to count only needs_input + blocked, and read "Needs a decision (3)"
+  # while SIX conductors were stopped — the other three sat under "No open
+  # question", a heading that reads as nothing-to-do. Three of them had been
+  # parked since 08-05 and nobody looked, which is the question Kyle asked:
+  # "why aren't the open sessions being reviewed?" The answer was that two thirds
+  # of them were not on the list. A task with no answerable question is still a
+  # task that is not moving; the split belongs in the sub-heading, not the count.
+  printf '⚠ Needs a decision (%d)\n' "$(( ${#needs_input[@]} + ${#blocked[@]} + ${#unclear[@]} ))"
+  if [ "${#needs_input[@]}" -gt 0 ]; then printf -- '- %s\n' "${needs_input[@]}"; fi
+  if [ "${#blocked[@]}" -gt 0 ]; then printf -- '- %s\n' "${blocked[@]}"; fi
+  # 📄 Reports to read — COUNT AND POINTER, no item list (2026-08-11). This was
+  # 261 of 428 lines and it is a backlog, not a queue: the median entry in the
+  # unlanded register had been surfaced 215 times.
+  #
+  # THE POINTER MUST NOT IMPLY THE TWO SETS ARE THE SAME. Measured 2026-08-11:
+  # the board had 259 here and `~/.cerebro/logs/unlanded-register` had 158, every
+  # one of which was also on the board. cb-unlanded `continue`s before
+  # registering for four separate reasons — already landed, code-lane
+  # deliverable, a live session, and a non-terminal skip — so the register is a
+  # strict, smaller subset by construction and the numbers legitimately differ.
+  # The line says what this count counts and calls the register the filtered
+  # view; writing "see cb-unlanded for the list" would be false.
+  if [ "${#ready[@]}" -gt 0 ]; then
+    printf '\n📄 Reports to read (%d) — every task whose report is unread; a backlog, not a queue. `cb-unlanded --blocking` lists only the ones a dev item is actually stalled on, and `cb-unlanded --report` re-derives a smaller register (it drops already-ingested, code-lane and live-session reports, so its count runs below this one).\n' "${#ready[@]}"
+  fi
+  if [ "${#relaunch[@]}" -gt 0 ]; then
+    printf '\n🔁 Needs relaunch (%d)\n' "${#relaunch[@]}"
+    printf -- '- %s\n' "${relaunch[@]}"
+  fi
+  # ❓ Stopped, no question asked — classified needs-input with nothing answerable:
+  # either no `gate:` was declared, so _decision_for projects nothing, or the
+  # declared question is already answered and sealed. Still state-derived and
+  # still self-clearing, but it now CARRIES ITS COUNT into the headline above.
+  #
+  # RENAMED from "No open question" 2026-08-07. The old name described the data
+  # accurately and misled completely: it says something about the gate, and a human
+  # reads it as something about the task. These need a different ACTION from a
+  # decision — go look at what it wants rather than answer what it asked — which is
+  # why the section stays separate. That is a different action, not a lower priority.
+  if [ "${#unclear[@]}" -gt 0 ]; then
+    printf '\n❓ Stopped, no question asked (%d) — go look, there is nothing to answer\n' "${#unclear[@]}"
+    printf -- '- %s\n' "${unclear[@]}"
+  fi
+  # Running / Paused / Done / Failed are omitted at zero from here (2026-08-11).
+  # See the ⚠ note above: "⚠ Needs a decision" still renders unconditionally, so
+  # an empty board is never mistaken for a failed render.
+  if [ "${#running[@]}" -gt 0 ]; then
+    printf '\n⏳ Running (%d)\n' "${#running[@]}"
+    printf -- '- %s\n' "${running[@]}"
+  fi
+  if [ "${#paused[@]}" -gt 0 ]; then
+    printf '\n⏸ Paused (%d)\n' "${#paused[@]}"
+    printf -- '- %s\n' "${paused[@]}"
+  fi
+  # ✓ Done — the N most recent by task-dir mtime, then a count of what is not
+  # shown. Pure history: every entry carries hard terminal evidence, and it ran
+  # to 98 items. The dropped count is printed, never implied.
+  if [ "${#done_list[@]}" -gt 0 ]; then
+    printf '\n✓ Done (%d)' "${#done_list[@]}"
+    if [ "${#done_list[@]}" -gt "$CB_BOARD_DONE_SHOW" ]; then
+      printf ' — %d most recent\n' "$CB_BOARD_DONE_SHOW"
+    else
+      printf '\n'
+    fi
+    while read -r _ds; do [ -n "$_ds" ] && printf -- '- %s\n' "$_ds"; done \
+      < <(printf '%s\n' "${done_sorted[@]}" | sort -rn -k1,1 | head -n "$CB_BOARD_DONE_SHOW" | cut -d' ' -f2-)
+    if [ "${#done_list[@]}" -gt "$CB_BOARD_DONE_SHOW" ]; then
+      printf -- '- … and %d older\n' "$(( ${#done_list[@]} - CB_BOARD_DONE_SHOW ))"
+    fi
+  fi
+  # ✗ Failed — count plus the only breakdown that changes what you'd do about it:
+  # a DECLINED PR is a decision someone already made, the rest died before a PR.
+  if [ "${#failed[@]}" -gt 0 ]; then
+    printf '\n✗ Failed (%d) — %d PR(s) declined · %d stopped before a PR. `cb-stuck <slug>` for one.\n' \
+      "${#failed[@]}" "$failed_declined" "$failed_nopr"
+  fi
+  # ℹ Auto-resumed (T31/M6): spend-wedge auto-resumes from the events log,
+  # trailing CB_FYI_WINDOW_SECS (24h) rather than strictly since-last-render —
+  # at the (fast, ~30s) tick cadence a since-last-render FYI would flash for one tick
+  # and vanish before anyone saw it. Omitted entirely when empty.
+  fyi=()
+  if [ -f "$CB_HOME/logs/events" ]; then
+    cutoff=$(( $(date +%s) - ${CB_FYI_WINDOW_SECS:-86400} ))
+    while IFS= read -r line; do
+      ts="${line%% *}"
+      [ "$(date -d "$ts" +%s 2>/dev/null || echo 0)" -ge "$cutoff" ] || continue
+      rest="${line#* }"; slug_ev="${rest%% *}"
+      attempt="$(printf '%s' "$rest" | grep -o 'attempt [0-9]*/[0-9]*')"
+      fyi+=("spend-wedge, task $slug_ev, $attempt ($(date -d "$ts" +%H:%M 2>/dev/null))")
+    done < <(grep ' auto-resumed attempt ' "$CB_HOME/logs/events" 2>/dev/null || true)
+  fi
+  if [ "${#fyi[@]}" -gt 0 ]; then
+    printf '\nℹ Auto-resumed (%d)\n' "${#fyi[@]}"
+    printf -- '- %s\n' "${fyi[@]}"
+  fi
+} | atomic_write "$CB_VAULT/board.md"
+echo "cb-board: wrote $CB_VAULT/board.md"

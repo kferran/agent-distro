@@ -1,0 +1,72 @@
+#!/usr/bin/env bash
+# scripts/cerebro/cb-stuck <slug> — R3 stuck-agent evidence printer.
+#
+# STRICTLY READ-ONLY. It never sends keys, never kills a session, never
+# relaunches, and never decides that a task IS stuck. It gathers what the
+# escalation ladder needs — pane tail, classified state, the resume command —
+# and prints the ladder beside it, so the judgement is made against evidence
+# instead of a guess.
+#
+# The ladder itself deliberately stays a documented procedure (.claude/skills/
+# board/SKILL.md). Deciding an agent is confused or looping is not mechanically
+# verifiable, which is exactly what Cerebro-spec §8.3's admission rule keeps out
+# of cb-watch. This command is a runbook with the evidence already filled in.
+set -euo pipefail
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$here/lib/paths.sh"; source "$here/lib/classify.sh"
+
+slug="${1:-}"
+[ -n "$slug" ] || { echo "usage: cb-stuck <slug>" >&2; exit 2; }
+cb_require_slug "$slug" || exit 2
+
+td="$(cb_task_dir "$slug")"
+[ -d "$td" ] || { echo "cb-stuck: no Cerebro task '$slug' (nothing under $td)" >&2; exit 1; }
+
+kind="$(_meta_field "$td" kind)"; [ -n "$kind" ] || kind=research
+sess="$(_meta_field "$td" session)"; [ -n "$sess" ] || sess="$slug"
+wt="$(_meta_field "$td" worktree)"
+target="$(_meta_field "$td" target)"
+alive="$(cb_session_alive "$sess")"
+
+echo "── $slug ──────────────────────────────────────────"
+printf 'kind      %s\n' "$kind"
+printf 'session   %s (%s)\n' "$sess" "$alive"
+[ -n "$wt" ] && printf 'worktree  %s\n' "$wt"
+[ -n "$target" ] && printf 'target    %s\n' "$target"
+printf 'state     %s\n' "$(classify "$td" 2>/dev/null || echo unknown)"
+gate="$(task_gate "$td" 2>/dev/null || true)"
+[ -n "$gate" ] && printf 'gate      %s\n' "$gate"
+
+# how long has it been quiet? a mtime, not a verdict — see rung 1
+newest="$(find "$td" -type f -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -1 || true)"
+if [ -n "$newest" ]; then
+  age=$(( $(date +%s) - ${newest%%.*} ))
+  printf 'last write %ss ago (%s)\n' "$age" "$(basename "${newest#* }")"
+fi
+
+echo
+echo "── pane tail ──────────────────────────────────────"
+if [ "$alive" = "alive" ]; then
+  eval "${CB_PEEK_CMD:-${CB_TMUX_BIN:-tmux} capture-pane -p -t \"$sess\" 2>/dev/null | tail -${CB_STUCK_TAIL:-30}}" \
+    || echo "(pane not readable)"
+else
+  echo "(session not alive — nothing to peek; this is rung 4/5 territory, not rung 1)"
+fi
+
+cat <<LADDER
+
+── the ladder (board skill; walk it in order) ─────
+1. Peek the pane — above. Read what it is doing before touching anything.
+2. Waiting on a question the brief already answers?
+     $here/cb-send $slug "<the answer>"
+3. Confused or looping? Interrupt (Escape), redirect with ONE corrective line.
+4. Genuinely wedged? Exit the agent, relaunch on the same worktree:
+     $here/cb-resume $slug${target:+ --target $target}
+   The worktree and its commits persist — this is cheap.
+5. Second relaunch fails? Mark it failed and escalate WITH the evidence above.
+
+A low context reading is not wedging; modern harnesses auto-compact and keep going.
+Do not pkill-and-restart the watcher as a routine operation.
+
+(cb-stuck is read-only — rungs 2-5 are yours to run.)
+LADDER

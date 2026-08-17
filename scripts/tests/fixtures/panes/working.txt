@@ -1,0 +1,7 @@
+⏺ Reading frontend/src/carriers/prudential/widgets/PrudentialAdditionalReplacementQuestions.vue
+
+⏺ The condition needs isLifePolicy added. Making the edit now.
+
+  Edit(frontend/src/carriers/prudential/widgets/...)
+
+⏺ Running pnpm run type-check to verify...

@@ -1,0 +1,9 @@
+⏺ Running the backend build to verify the change compiles...
+
+  dotnet build ultron-backend.sln
+
+You've hit your monthly spend limit. Visit /usage-credits to review usage
+or add credits to continue.
+
+> Press up to edit queued messages
+new task? /clear

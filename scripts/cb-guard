@@ -1,0 +1,246 @@
+#!/usr/bin/env bash
+# scripts/cerebro/cb-guard — the guard's guard (T37, spec §2.4): who watches
+# the watcher. Run from cron or a timer, independent of cb-watch:
+#   (a) tasks in flight but the watcher heartbeat stale > 2 ticks (or absent)
+#       -> "watcher down" alert. Heartbeat, not logs/events mtime — events
+#       only move on state CHANGES, so a quiet-but-healthy watcher would
+#       false-alarm on the events file.
+#   (b) `claude mcp list` connector health -> "X needs re-auth" escalation,
+#       scoped by CB_MCP_CRITICAL to the connectors fleet automation uses.
+#   (c) alert delivery, edge-triggered and content-deduped (lib/dedup.sh) so a
+#       standing condition alerts once and a cleared-then-recurring one alerts
+#       again = events log (board-visible) + tmux line into the
+#       coordinator + pure-bash push fallback (CB_PUSH_URL, e.g. ntfy) that
+#       works even when the authed stack is down. Push token via curl
+#       --config stdin — same secrets-off-argv discipline as everything else.
+set -euo pipefail
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"; source "$here/lib/paths.sh"; source "$here/lib/push.sh"; source "$here/lib/coordinator.sh"; source "$here/lib/dedup.sh"
+: "${CB_TICK_SECS:=30}"   # must track cb-watch's tick default (finding #3): the watcher-down window below is 2 ticks
+# Connections FLEET AUTOMATION actually depends on. An ALLOWLIST, not a denylist:
+# the defect this replaces was 1,537 warnings about plugin:voicemode, which no
+# fleet path touches, and a denylist would have let the next unused plugin
+# re-create it. Tokens are matched case-insensitively as substrings of the name
+# `claude mcp list` prints, so one token covers both transports of a service
+# ("claude.ai Atlassian Rovo" and "plugin:atlassian:atlassian").
+: "${CB_MCP_CRITICAL:=atlassian gmail drive calendar kusto slack playwright}"
+
+alerts=()
+raise() { alerts+=("$1"); }   # collect; delivery + dedup happen once, at the end
+
+# (a) watcher liveness — only meaningful when something is actually in flight
+in_flight=0
+for b in "$CB_HOME"/beacons/*.state; do
+  [ -f "$b" ] || continue
+  case "$(cat "$b")" in running|needs-input|blocked) in_flight=1; break;; esac
+done
+if [ "$in_flight" -eq 1 ]; then
+  hb="$CB_HOME/beacons/watch.heartbeat"
+  if [ ! -f "$hb" ] || [ $(( $(date +%s) - $(stat -c %Y "$hb") )) -gt $(( CB_TICK_SECS * 2 )) ]; then
+    raise "watcher down (heartbeat stale, tasks in flight) — check cerebro-watch.service"
+  fi
+fi
+
+# (b) MCP connector health, scoped to CB_MCP_CRITICAL — aggregated PER SERVICE.
+#
+# A service is DOWN only when EVERY row matching its token is unhealthy. One
+# healthy transport means the fleet can still reach the service, so it is not an
+# alarm. Measured 2026-08-14: `atlassian` matched THREE rows — "claude.ai Atlassian
+# Rovo" (needs authentication), "claude.ai Atlassian" (connected), and
+# "plugin:atlassian:atlassian" (connected). Row-level alerting raised "claude.ai
+# Atlassian Rovo needs re-auth" while every fleet Jira call was succeeding through
+# the other two, and nothing in the fleet uses Rovo at all.
+#
+# That is the same defect as the 1,537 voicemode lines this allowlist replaced, one
+# level up: the old bug alerted on a connector nobody depends on, this one alerted
+# on a TRANSPORT nobody depends on. Both produce an alert that is true as written
+# and useless to act on. The header above already described the intent — "one token
+# covers both transports of a service" — but the loop evaluated per row.
+declare -A svc_rows svc_down svc_downnames
+while IFS= read -r line; do
+  [ -n "$line" ] || continue
+  # Line shape is `<name>: <transport> - <status>`. The name may itself contain
+  # colons (plugin:voicemode:voicemode), so cut the status off first and take
+  # everything before the LAST `: ` — `${line%%:*}` yielded the bare word
+  # "plugin" for every plugin-hosted connector, which is what made 1,537 log
+  # lines read "plugin needs re-auth" and name nothing.
+  lhead="${line%% - *}"; name="${lhead%: *}"
+  lname="$(printf '%s' "$name" | tr '[:upper:]' '[:lower:]')"
+  for c in $CB_MCP_CRITICAL; do
+    case "$lname" in
+      *"$c"*)
+        svc_rows[$c]=$(( ${svc_rows[$c]:-0} + 1 ))
+        # ✘ (U+2718) as well as ✗ (U+2717): the harness prints the former, and the
+        # only reason the old regex still fired at all was the "failed" alternative.
+        if printf '%s' "$line" | grep -qiE '✗|✘|disconnected|needs auth|failed'; then
+          svc_down[$c]=$(( ${svc_down[$c]:-0} + 1 ))
+          svc_downnames[$c]="${svc_downnames[$c]:+${svc_downnames[$c]}, }$name"
+        fi
+        break                         # first matching token owns the row, as before
+        ;;
+    esac
+  done
+done < <(eval "${CB_MCP_CMD:-claude mcp list 2>/dev/null}" || true)
+
+for c in $CB_MCP_CRITICAL; do
+  rows=${svc_rows[$c]:-0}; down=${svc_down[$c]:-0}
+  # A token matching NO rows means the connector is not configured at all.
+  # Deliberately NOT an alarm here — this script's whole history is over-alerting,
+  # and an absent-connector check is a different question from a health check.
+  [ "$rows" -gt 0 ] || continue
+  [ "$down" -eq "$rows" ] || continue  # ≥1 healthy transport → the service is reachable
+  raise "${svc_downnames[$c]} needs re-auth (claude mcp list reports it down; no healthy $c transport remains)"
+done
+
+# (d) gate-vocabulary canary. classify_code decides whether a live conductor is
+# waiting on a human by matching the manifest's `current_task`, which is free
+# text a model writes. The old sentinel (`*/awaiting-approval`) drifted to a
+# 1-in-1600 hit rate and nobody noticed, because a gate predicate that never
+# fires looks exactly like "no conductor is at a gate."
+#
+# So the watchdog watches the predicate. Any live `current_task` that neither
+# CB_GATE_PATTERN nor CB_PROGRESS_PATTERN has an opinion about is NEW VOCABULARY
+# and gets surfaced by name, once per distinct set. This is the audit's
+# generalizable finding made executable: the predicate reports what it does not
+# understand instead of quietly returning false.
+if [ "${CB_GATE_CANARY:-1}" = 1 ]; then
+  source "$here/lib/classify.sh" 2>/dev/null || true
+  if declare -F cb_gate_vocab_class >/dev/null 2>&1; then
+    unknown=""
+    for td in "$CB_HOME"/tasks/*/; do
+      [ -f "$td/meta" ] || continue
+      wt="$(awk -F= '$1=="worktree"{sub("^worktree=","");print;exit}' "$td/meta" 2>/dev/null)"
+      [ -n "$wt" ] && [ -d "$wt" ] || continue
+      run="$(resolve_run "$wt" "$(basename "${td%/}")" \
+             "$(awk -F= '$1=="jira"{sub("^jira=","");print;exit}' "$td/meta" 2>/dev/null)" 2>/dev/null)" || continue
+      cur="$(manifest_field "$run" current_task 2>/dev/null)"
+      [ -n "$cur" ] || continue
+      [ "$(cb_gate_vocab_class "$cur")" = unknown ] || continue
+      case " $unknown " in *" $cur "*) ;; *) unknown="$unknown $cur";; esac
+    done
+    [ -n "$unknown" ] && raise "conductor gate detection has no opinion on current_task value(s):${unknown} — classify_code cannot tell a human gate from work in progress for these, so a paused conductor there reads as work. Widen CB_GATE_PATTERN/CB_PROGRESS_PATTERN in lib/classify.sh."
+  fi
+fi
+
+# (e) coordinator pane-signature canary (2026-08-02). Same finding as (d), one
+# layer down: lib/coordinator.sh's pane signatures are keyed on Claude-TUI chrome,
+# the TUI renames its chrome per version, and a signature that matches NOTHING is
+# indistinguishable from a quiet fleet. `? for shortcuts` and `esc to interrupt`
+# died sometime before 2026-07-24 and nobody noticed, while every escalation
+# deferred — DEFER-ALARMs continuous since 2026-07-15T13:53Z (335 of them by
+# 2026-08-02T13:34Z, still incrementing at the time of the fix).
+#
+# So the watchdog watches the signatures, and neither check needs to know what the
+# current spinner vocabulary IS — which is the point, because that vocabulary is
+# exactly what drifts:
+#   BUSY  — sample each pane twice. A pane whose TRANSCRIPT changed between the two
+#           samples is demonstrably working. If CB_COORD_BUSY_RE matched neither
+#           sample, the busy signature has drifted, and the pane is named. Comparing
+#           the COMPOSER across the two samples separates work from Kyle typing —
+#           a pane whose composer also changed is someone at the keyboard, not drift.
+#   READY — the composer read replaced the READY regex, so its failure mode is the
+#           `❯` glyph being renamed. If NO live pane yields a readable composer,
+#           READY is dead the same way the regexes were.
+#
+# Reports to the events log (via raise → the (c) block) rather than only to the
+# coordinator, deliberately: the thing being reported on IS the coordinator channel,
+# and (c) already notes that a guard-deferred alert is not retried. Warn-only —
+# cb-guard never blocks. Throttled, because cb-guard rides every cb-* command and
+# this one costs a sleep.
+#
+# KEEP THE EVIDENCE. The first cut of this canary said "re-seed from a live
+# capture-pane" and threw the capture away — it fired twice, reached Kyle both
+# times, and neither alert carried the one fact needed to act (the missing form
+# was a bare `✻ Considering…` with no timer). The sample that trips the alarm is
+# unreproducible on demand at ~1/45, so discarding it costs a full re-derivation.
+#
+# It goes to the events log and a capture file, NOT into the alert text: `raise`
+# feeds the (c) dedup, which keys on the whole message, so embedding a live
+# screen would defeat the dedup and re-page on every spinner frame. The events
+# line is written only when the capture actually CHANGES, so a standing drift
+# does not turn into the 1,537-duplicate-lines problem in a different column.
+coord_evidence() {   # PANE WHY SAMPLE_A SAMPLE_B
+  local p="$1" why="$2" sa="$3" sb="$4" cap_file="$CB_HOME/logs/coord-canary.capture" new
+  new="$(printf '# cb-guard coordinator canary — pane %s\n# %s\n# CB_COORD_BUSY_RE=%s\n# sample A:\n%s\n# sample B:\n%s\n' \
+         "$p" "$why" "$CB_COORD_BUSY_RE" "$sa" "$sb")"
+  # unchanged evidence → the file is still accurate, no new events line
+  [ "$new" = "$(sed '1d' "$cap_file" 2>/dev/null)" ] && return 0
+  mkdir -p "$CB_HOME/logs"
+  { printf '# %s\n' "$(date -Is)"; printf '%s\n' "$new"; } > "$cap_file" 2>/dev/null || true
+  printf '%s cb-guard COORD-CANARY-EVIDENCE pane=%s why=%s tail=%s\n' "$(date -Is)" "$p" "$why" \
+    "$(printf '%s\n' "$sa" | grep -v '^[[:space:]]*$' | tail -15 | sed 's/^[[:space:]]*//' | paste -sd'⏎' -)" \
+    >> "$CB_HOME/logs/events" 2>/dev/null || true
+}
+if [ "${CB_COORD_CANARY:-1}" = 1 ]; then
+  cmark="$CB_HOME/beacons/coord-canary.last"
+  cage=$(( $(date +%s) - $(stat -c %Y "$cmark" 2>/dev/null || echo 0) ))
+  if [ "$cage" -ge "${CB_COORD_CANARY_SECS:-300}" ]; then
+    mkdir -p "$CB_HOME/beacons"; : > "$cmark"
+    panes=(); capA=()
+    while IFS= read -r p; do [ -n "$p" ] && panes+=("$p"); done < <(cb_coord_pane_list)
+    if [ "${#panes[@]}" -gt 0 ]; then
+      for p in "${panes[@]}"; do capA+=("$(cb_coord_capture "$p")"); done
+      sleep "${CB_COORD_CANARY_SETTLE:-1.2}"
+      composer_seen=0 busy_drift="" false_busy="" i=0
+      for p in "${panes[@]}"; do
+        a="${capA[$i]}"; i=$(( i + 1 ))
+        [ -n "$a" ] || continue
+        ca="$(cb_coord_composer "$a" 2>/dev/null)" || continue   # not a Claude pane
+        composer_seen=1
+        b="$(cb_coord_capture "$p")"
+        if printf '%s\n' "$a" | grep -qE "$CB_COORD_BUSY_RE"; then
+          # BUSY matched. Check the OTHER polarity, which the drift test below is
+          # structurally blind to: does it match a pane that is provably IDLE?
+          # A static transcript across the settle window means nothing is running
+          # (the work timer ticks every second), and an empty composer means
+          # nobody is typing — so a BUSY match there is a FALSE POSITIVE, and a
+          # permanent one, because the line that matched is sitting in the
+          # transcript rather than being redrawn. That reads `busy` forever →
+          # every escalation defers → the 2026-07-15 bug restored, just from the
+          # opposite direction. Widening BUSY is the safe direction only up to
+          # the point where it starts matching finished panes; this is where that
+          # gets caught.
+          if [ -n "$b" ] && [ "$a" = "$b" ] && [ -z "$ca" ]; then
+            false_busy="$false_busy $p"
+            coord_evidence "$p" 'FALSE BUSY — static transcript, empty composer' "$a" "$b"
+          fi
+          continue
+        fi
+        [ -n "$b" ] && [ "$a" != "$b" ] || continue              # static pane — proves nothing
+        printf '%s\n' "$b" | grep -qE "$CB_COORD_BUSY_RE" && continue
+        cb="$(cb_coord_composer "$b" 2>/dev/null)" || continue
+        [ "$ca" = "$cb" ] || continue                            # composer moved → a human typing
+        busy_drift="$busy_drift $p"
+        coord_evidence "$p" 'BUSY matched nothing — transcript advanced, composer held still' "$a" "$b"
+      done
+      if [ -n "$busy_drift" ]; then
+        raise "coordinator BUSY signature matches nothing on working pane(s):${busy_drift} — their transcripts advanced between two samples while their composers held still, so they were working and CB_COORD_BUSY_RE alone did not see it. ⚠️ THIS IS REGEX-DRIFT INFORMATION, NOT A LIVE SEND HAZARD, AND THE FIX IS NOT TO WIDEN THE REGEX. This canary tests CB_COORD_BUSY_RE in isolation; the actual send decision is cb_coord_pane_state, whose RUNG 5 re-samples the transcript and reads an advancing pane as busy — which is the same evidence this canary just used, so the send path already refuses. Widening the regex to match a streaming frame was evaluated on 2026-08-05 and rejected: the busy tail and the idle tail are structurally IDENTICAL during a stream, so any pattern that matches one matches the other and every pane reads busy forever (the always-defer bug, which cost a Ph1-TL-W1 Blocker 26 hours on 2026-08-07). The signal is BETWEEN two frames, not in one. Both samples are kept in logs/coord-canary.capture and inline on the COORD-CANARY-EVIDENCE events line above — read them, and read the RUNG 5 block in lib/coordinator.sh, before touching anything. Act on this only if RUNG 5 is disabled (CB_COORD_ADVANCE_SECS=0) or the capture contains a genuine busy form the regex misses."
+      fi
+      if [ -n "$false_busy" ]; then
+        raise "coordinator BUSY signature matches an IDLE pane:${false_busy} — transcript static across the settle window and composer empty, so nothing is running, yet CB_COORD_BUSY_RE matched. The matching line is persisted transcript, not a live spinner, so that pane reads busy permanently and every escalation to it defers forever. Narrow CB_COORD_BUSY_RE in lib/coordinator.sh; the matched line is in logs/coord-canary.capture."
+      fi
+      if [ "$composer_seen" -eq 0 ]; then
+        raise "coordinator READY test is dead: no live pane yields a readable \`❯\` composer box, so cb_coord_pane_state can never return \`empty\` and EVERY escalation defers forever (the 2026-08-02 defect: DEFER-ALARMs continuous since 2026-07-15). The composer glyph has most likely been renamed by a TUI update — re-derive cb_coord_composer in lib/coordinator.sh, and cb-send's _cb_composer with it."
+      fi
+    fi
+  fi
+fi
+
+# (c) delivery — edge-triggered content dedup (lib/dedup.sh). Only alerts that
+# were NOT active on the previous run are delivered; the state file is rewritten
+# every run, including the zero-alert run that re-arms a cleared alert. The
+# suppression covers the coordinator send and the push as well as the events
+# line — 1,537 duplicate tmux injections were no more readable than 1,537 log
+# lines. Consequence worth knowing: an alert the R17 composer guard defers is
+# not retried next tick. The events line and the push are the durable records
+# by design (see the header), so the alert is not lost, only the tmux copy.
+mkdir -p "$CB_HOME/logs" "$CB_HOME/beacons"
+while IFS= read -r msg; do
+  [ -n "$msg" ] || continue
+  printf '%s cb-guard %s\n' "$(date -Is)" "$msg" >> "$CB_HOME/logs/events"
+  # R17: guarded coordinator send — defers on a non-empty/dead pane (a bare send
+  # into a login shell would execute the text).
+  cb_coord_send "cb-guard: $msg" || true
+  cb_push "cb-guard: $msg" || true   # out-of-band fallback (lib/push.sh) — no-op if no channel
+done < <(cb_dedup_new "$CB_HOME/beacons/guard.alerts" "${alerts[@]+"${alerts[@]}"}")
+
+exit 0

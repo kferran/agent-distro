@@ -1,0 +1,152 @@
+#!/usr/bin/env bash
+# cb-pipeline — where is every ticket that should have work on it, and what is
+# the next action?
+#
+# WHY THIS EXISTS (2026-08-13). Kyle: "What do we need to fix so that tickets
+# like these two get picked and someone is dispatched to work on them? … This
+# issue meaning the pipeline from failed ticket identified to work being
+# completed."
+#
+# The pipeline is supposed to run:
+#
+#   failed QE / reopened  ->  RCA dispatched  ->  RCA landed (/ingest)
+#     ->  dev item queued  ->  cb-intake claims  ->  conductor  ->  PR  ->  merge
+#
+# Every stage transition is EDGE-TRIGGERED: something happens, the next stage
+# starts. Nothing anywhere re-examines current state. So a missed edge is
+# permanent, and three of them were measured on 2026-08-13:
+#
+#   BREAK 1 — tl-wave-sweep §5c dispatches an RCA only for a bounce that is NEW
+#   since last run. A standing bounce collapses to "N standing (unchanged)" and
+#   is never actioned again. EJA-4020: High, unassigned, Failed QE, twenty
+#   consecutive ticks, no RCA, no dev item, nobody on it.
+#
+#   BREAK 2 — an RCA lands in the vault only via a manual /ingest, and
+#   cb-unlanded --blocking can only see it if some dev item's hold:/blocked:
+#   already names the task slug. EJA-3916's RCA is complete and unlanded, and
+#   nothing reports it as blocking because no dev item points at it.
+#
+#   BREAK 3 — cb-intake claims `status: queued` ONLY. An item that reached
+#   `active` and then stalled (worktree reaped, conductor died, session lost)
+#   stays `active` forever and is invisible to intake. Measured: 48 of 54 active
+#   dev items have no live worktree. That is not a backlog, it is a dead lane.
+#
+# THE FIX IS LEVEL-TRIGGERED. This script asks, for every ticket that SHOULD have
+# work on it, "what stage is it actually at?" — from current state, not from a
+# transition anyone might have missed — and names the next action. Run it every
+# tick. A missed edge then costs an hour instead of forever.
+#
+#   cb-pipeline --report              stage every ticket, name the next action
+#   cb-pipeline --reconcile           also apply the SAFE actions (see below)
+#   cb-pipeline --keys "K1 K2"        restrict to specific EJA keys
+#
+# WHAT --reconcile MAY DO, and nothing else:
+#   * demote a stalled `active` dev item (no live worktree, last_synced older
+#     than CB_STALL_DAYS) back to `queued`, so cb-intake can reclaim it. Safe
+#     because intake's own gates — live assignee, dedup, spec-gate, arch-check —
+#     all still apply on the way back out. It is a re-offer, not a dispatch.
+# It NEVER edits Jira, never spawns, never pushes, never touches a live worktree.
+# Dispatching an RCA is a judgement call and stays with the caller (the
+# tl-wave-sweep skill), which has the ticket context this script does not.
+
+set -euo pipefail
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+VAULT="${CB_VAULT:-$HOME/vault}"
+ITEMS="$VAULT/00 Inbox"
+ARCHIVE="$VAULT/02 Areas/development/archive/items"
+INBOX="$VAULT/00 Inbox"
+: "${CB_STALL_DAYS:=3}"
+
+mode="report"; keys=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --report) mode="report"; shift;;
+    --reconcile) mode="reconcile"; shift;;
+    --keys) keys="${2:-}"; shift 2;;
+    *) echo "usage: cb-pipeline [--report|--reconcile] [--keys \"EJA-1 EJA-2\"]" >&2; exit 2;;
+  esac
+done
+
+# --- helpers ---------------------------------------------------------------
+
+# item_for KEY — path of the dev item tracking KEY, live or archived, matched on
+# the jira:/tickets: frontmatter ONLY. Never on the slug: grepping a bare key
+# across filenames produced six false mappings (feedback_ground_dev_items_against_jira).
+item_for() {
+  local key="$1" f
+  for f in "$ITEMS"/*.md "$ARCHIVE"/*.md; do
+    [ -f "$f" ] || continue
+    if awk '/^---$/{n++; next} n==1' "$f" 2>/dev/null \
+       | grep -qE "^(jira|tickets):.*\b${key}\b"; then
+      printf '%s\n' "$f"; return 0
+    fi
+  done
+  return 1
+}
+
+fm() { awk -v k="$2" '/^---$/{n++; next} n==1 && $0 ~ "^"k":" {sub("^"k":[[:space:]]*",""); print; exit}' "$1" 2>/dev/null; }
+
+# rca_for KEY — a same-or-recent RCA doc naming the key in its filename.
+rca_for() {
+  local key lc f
+  key="$1"; lc="$(printf '%s' "$key" | tr 'A-Z' 'a-z')"
+  for f in "$INBOX"/*rca*"$lc"*.md "$INBOX"/*"$lc"*rca*.md; do
+    [ -f "$f" ] && { printf '%s\n' "$f"; return 0; }
+  done
+  return 1
+}
+
+age_days() { local d="$1"; [ -n "$d" ] || { echo 9999; return; }
+  local t; t="$(date -d "$d" +%s 2>/dev/null)" || { echo 9999; return; }
+  echo $(( ( $(date +%s) - t ) / 86400 )); }
+
+# --- stage one key ---------------------------------------------------------
+# Emits: KEY<TAB>STAGE<TAB>NEXT-ACTION<TAB>DETAIL
+stage_key() {
+  local key="$1" item wt slug st sync rca
+  if ! item="$(item_for "$key")"; then
+    if rca="$(rca_for "$key")"; then
+      printf '%s\tRCA-LANDED-NO-ITEM\tcreate the dev item from the RCA and queue it\t%s\n' "$key" "${rca#$VAULT/}"
+    else
+      printf '%s\tNOTHING\tdispatch an RCA — no dev item and no RCA doc exist\t-\n' "$key"
+    fi
+    return
+  fi
+  case "$item" in "$ARCHIVE"/*) printf '%s\tARCHIVED\tnone — item is archived; verify the ticket state matches\t%s\n' "$key" "${item#$VAULT/}"; return;; esac
+  st="$(fm "$item" status)"; slug="$(fm "$item" slug)"; sync="$(fm "$item" last_synced)"
+  wt="$(fm "$item" worktree_path)"; wt="${wt/#\~/$HOME}"
+  case "$st" in
+    queued)   printf '%s\tQUEUED\tnone — cb-intake will claim it\t%s\n' "$key" "$slug";;
+    drafting) printf '%s\tDRAFTING\tresolve the hold, then flip to queued\t%s\n' "$key" "$slug";;
+    done)     printf '%s\tDONE\tnone\t%s\n' "$key" "$slug";;
+    active)
+      if [ -n "$wt" ] && [ -d "$wt" ]; then
+        printf '%s\tACTIVE-LIVE\tnone — worktree present\t%s\n' "$key" "$slug"
+      else
+        local d; d="$(age_days "$sync")"
+        if [ "$d" -ge "$CB_STALL_DAYS" ]; then
+          printf '%s\tACTIVE-STALLED\tdemote to queued so intake can reclaim (no worktree, last_synced %sd)\t%s\n' "$key" "$d" "$slug"
+        else
+          printf '%s\tACTIVE-NOWT\tnone yet — no worktree but only %sd since last_synced\t%s\n' "$key" "$d" "$slug"
+        fi
+      fi;;
+    *) printf '%s\tUNKNOWN-STATUS(%s)\tinspect the item\t%s\n' "$key" "$st" "$slug";;
+  esac
+}
+
+[ -n "$keys" ] || { echo "cb-pipeline: --keys is required (pass the failed/reopened set)" >&2; exit 2; }
+
+printf 'KEY\tSTAGE\tNEXT ACTION\tDETAIL\n'
+demoted=0
+for k in $keys; do
+  line="$(stage_key "$k")"
+  printf '%s\n' "$line"
+  if [ "$mode" = "reconcile" ] && printf '%s' "$line" | grep -q 'ACTIVE-STALLED'; then
+    item="$(item_for "$k")" || continue
+    sed -i 's/^status: active/status: queued/' "$item"
+    printf '  ↳ demoted to queued: %s\n' "${item#$VAULT/}"
+    demoted=$((demoted+1))
+  fi
+done
+[ "$mode" = "reconcile" ] && printf '\ncb-pipeline: %d demoted to queued\n' "$demoted"
+exit 0

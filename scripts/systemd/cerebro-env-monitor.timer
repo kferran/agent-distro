@@ -1,0 +1,13 @@
+# cerebro-env-monitor.timer — hourly at :37, matching the cron slot it replaces
+# (deliberately offset from the fleet tick at :23 so the two do not contend).
+[Unit]
+Description=Cerebro env log monitor schedule (hourly at :37)
+
+[Timer]
+OnBootSec=300
+OnCalendar=*-*-* *:37:00
+AccuracySec=60
+Persistent=true
+
+[Install]
+WantedBy=timers.target

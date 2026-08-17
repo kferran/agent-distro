@@ -1,0 +1,249 @@
+#!/usr/bin/env bash
+# cb-reap --sweep [--dry-run] — conservative fleet cleanliness sweep.
+# Reaps DONE / IDLE X-Men to free slots, ALWAYS keeping worktrees, and logs a
+# resume note so work can be picked up later. Designed to run every intake tick.
+#
+# Reap rules (conservative — option (a), Kyle 2026-07-22):
+#   RESEARCH/OPS windows (in the `cb` session): reap iff `report.md` exists AND
+#     lib/classify.sh classifies the task done. State is DERIVED, never read from
+#     the beacon — see the long note above that block. `ready-for-review`/`failed`
+#     reap after a short race floor (DONE_QUIET_MIN); `needs-input`/`blocked`/
+#     `paused` are kept (awaiting Kyle); a bare `running` with no terminal report
+#     falls back to the idle-window proxy (WIN_IDLE_MIN).
+#   CODE conductors (standalone tmux sessions that own a $CB_WT_BASE/<slug>):
+#     also DERIVED, via classify_code — which never reads the beacon (it keys on
+#     cb-cleanup's `done` marker, pr.state, summary.md, the manifest gate, session
+#     liveness and the OOM/wedge pane signatures). Order: a declared `paused:`
+#     reaps-as-paused first; `needs-input`/`blocked`/`needs-relaunch` are kept;
+#     `done`/`failed` reap on that terminal evidence alone; otherwise fall through
+#     to the commit arithmetic — pushed work (ahead>0, unpushed=0) or never-built
+#     (ahead=0, no `status: active` dev item). Worktree is ALWAYS kept
+#     (kill-session never touches it); resume via `cb-resume <slug>`, which adopts,
+#     re-briefs and delivers the launch line — `cb-start --code --adopt` alone is
+#     half a dispatch and leaves an agent at an empty composer.
+#   NEVER reap: `Cerebro`, `cb`, or any slug in $CB_HOME/reap-protect.
+set -euo pipefail
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# classify.sh owns "is this task done" — see the research block below for why this
+# script must NOT re-derive it from the beacon.
+source "$here/lib/classify.sh"
+# unlanded.sh owns "is this report's finding represented in the vault" — the same
+# predicate cb-unlanded reports on. cb-reap used to assert "⚠️ report NOT ingested"
+# on EVERY reaped research task without checking, which is false for any task whose
+# deliverable IS a vault file it already wrote (the env-error-monitor writes its own
+# trend line every run). Crying wolf on a landed report costs more than silence:
+# it trains the reader to skip the warning that is real. Pure function library,
+# no side effects at source time.
+source "$here/lib/unlanded.sh"
+VAULT="${VAULT_DIR:-$HOME/vault}"
+# Honor CB_HOME like every other cb-* script. This was hardcoded to $HOME,
+# which is why cb-reap was the one script with no bats suite — it could not be
+# pointed at a fixture. Fixed 2026-07-30 alongside the beacon-derivation change.
+CB_HOME="${CB_HOME:-$HOME/.cerebro}"
+TASKS="$CB_HOME/tasks"
+WT_BASE="${CB_WT_BASE:-$HOME/code/worktrees}"   # overridable for the same testability reason as CB_HOME
+ITEMS="$VAULT/00 Inbox"
+PROTECT_FILE="$CB_HOME/reap-protect"
+IDLE_MIN="${CB_REAP_IDLE_MIN:-120}"
+WIN_IDLE_MIN="${CB_REAP_WIN_IDLE_MIN:-20}"   # tmux window/session must be quiet this long to reap
+# Short floor used ONLY when classify says the task is genuinely done (report.md
+# terminal frontmatter). A finished-but-alive Claude TUI keeps redrawing, so the
+# 20-minute quiet proxy above rarely passes — which is why finished agents held
+# slots all of 2026-07-29. Positive evidence of completion does not need it.
+DONE_QUIET_MIN="${CB_REAP_DONE_QUIET_MIN:-5}"
+
+mode=""; dry=""
+for a in "$@"; do case "$a" in
+  --sweep) mode=sweep;; --dry-run) dry=1;; *) echo "cb-reap: unknown arg $a" >&2; exit 2;;
+esac; done
+[ "$mode" = sweep ] || { echo "usage: cb-reap --sweep [--dry-run]" >&2; exit 2; }
+
+now=$(date +%s)
+protected() { grep -qxF "$1" "$PROTECT_FILE" 2>/dev/null; }
+# NB: the old state() helper is GONE (2026-07-30). It grepped the beacon's last
+# 400 chars for a terminal keyword — a second, wrong implementation of "is it
+# done" that both branches now get from lib/classify.sh instead. Deleting it
+# rather than leaving it unused is deliberate: an available beacon-grep is an
+# invitation to reintroduce the defect.
+# queue_ingest SLUG — a reap must never be able to LOSE a finding.
+# Reaping frees the slot; it does not land the report, and it cannot: the
+# operating contract lists "landing a finding" under where a human is
+# structurally required, because /ingest decides the destination and that is
+# judgment. So instead of auto-ingesting (wrong) or dropping it (what happened),
+# every reaped research/ops task with a terminal report is APPENDED to a durable
+# ingest queue, mirroring cb-cleanup's distill log for code tasks
+# (cb-cleanup:58). Drained by marking the line `[ingested-YYYY-MM-DD]`.
+# We deliberately queue unconditionally rather than running a landed check first:
+# the slug-grep landed check was proven wrong in BOTH directions on 2026-07-29
+# (a forward reference masked an unlanded report; a landed deliverable that never
+# named its own slug read as unlanded). A duplicate queue line is cheap; a lost
+# 47KB RCA is not. The declared `deliverable:` path is recorded when present —
+# that is the one signal that classified correctly every time.
+queue_ingest() {
+  # NB: separate `local` statements are required, not one combined declaration.
+  # `local` is a builtin, so ALL of its arguments are word-expanded before any
+  # assignment takes effect — `local slug="$1" td=".../$slug"` expands $slug while
+  # it is still unbound, which `set -u` turns into a hard error.
+  [ -n "$dry" ] && return 0   # --dry-run must have NO side effects, queue included
+  local slug="$1"
+  local td="$CB_HOME/tasks/$slug"
+  local rep="$td/report.md"
+  local st dl
+  [ -f "$rep" ] || return 0
+  st="$(head -14 "$rep" | awk '/^status:/{sub(/^status:[[:space:]]*/,"");print;exit}')"
+  case "$st" in complete|done|partial) : ;; *) return 0;; esac
+  dl="$(head -14 "$rep" | awk '/^deliverable:/{sub(/^deliverable:[[:space:]]*/,"");print;exit}')"
+  mkdir -p "$CB_HOME/logs"
+  printf '%s %s report=%s deliverable=%s\n' \
+    "$(date -Is)" "$slug" "$rep" "${dl:-none}" >> "$CB_HOME/logs/ingest-queue"
+}
+
+# ingest_note SLUG — what to SAY about the report on the reap line. Delegates the
+# landedness call to ul_classify (lib/unlanded.sh), the same predicate cb-unlanded
+# reports on, so the two surfaces can never disagree about the same task. The queue
+# line is still written unconditionally by queue_ingest — queueing is cheap and a
+# lost finding is not; this only governs the wording.
+ingest_note() {
+  local slug="$1" td="$CB_HOME/tasks/$1" cls
+  cls="$(ul_classify "$td" "$VAULT" 2>/dev/null | cut -f1)" || cls=""
+  case "$cls" in
+    landed) printf 'report landed in the vault — nothing to ingest.' ;;
+    skip)   printf 'report kept at %s/report.md (not an ingest candidate).' "$td" ;;
+    *)      printf '⚠️ report NOT ingested: %s/report.md — queued at $CB_HOME/logs/ingest-queue, run /ingest' "$td" ;;
+  esac
+}
+
+active_devitem() { # 0 if a dev item for this slug is status: active
+  local slug="$1" f
+  for f in "$ITEMS"/*"$slug"*.md; do [ -e "$f" ] || continue
+    grep -qiE '^status:[[:space:]]*active' "$f" && return 0; done
+  return 1
+}
+
+reaped=()
+kill_win() { [ -n "$dry" ] && { echo "WOULD reap $1"; return; }; tmux kill-window -t "$2" 2>/dev/null && echo "reaped $1"; }
+kill_ses() { [ -n "$dry" ] && { echo "WOULD reap $1"; return; }; tmux kill-session -t "$2" 2>/dev/null && echo "reaped $1"; }
+
+# ---- research/ops windows in cb ----
+# STATE IS DERIVED, NOT READ FROM THE BEACON (2026-07-30).
+# This block used to grep the beacon via the local state() helper. That was a
+# SECOND, WRONG implementation of "is it done" — and it lost, because the beacon
+# vocabulary has no terminal word. cb-brief tells agents to write only
+# running/paused/blocked and says "report.md is still your terminal deliverable",
+# so a finished agent's last line is legitimately `running:` or, worse, `blocked:`
+# used to mean "done, awaiting a human". Consequences observed 2026-07-29:
+#   * asd-1226-attemptsubmission-stranding — beacon "blocked: deliverables
+#     written", report.md `status: complete` → pinned a finished slot forever.
+#   * four conductors shipped PRs #2618-#2621 with beacons still on `running`.
+#   * 110 of 125 finished tasks had a report.md and a `running` beacon.
+# lib/classify.sh already gets this right: report.md terminal frontmatter wins
+# OUTRIGHT, before the beacon is consulted. Use it rather than re-deriving.
+# The code-conductor branch below does the same via classify_code.
+if tmux has-session -t cb 2>/dev/null; then
+  while read -r w act; do
+    [ -z "$w" ] || [ "$w" = bash ] && continue
+    protected "$w" && continue
+    [ -f "$TASKS/$w/report.md" ] || continue
+    quiet_min=$(( (now - ${act:-0}) / 60 ))
+    # A DECLARED PAUSE outranks a terminal report. The contract defines `paused:`
+    # as "a deliberate wait on a known external clear" — the agent is saying it
+    # has more to do once the answer arrives, and its report is an interim
+    # deliverable. Reaping that discards live context (caught 2026-07-30: the fix
+    # below would have reaped jones-forms-current-identifier-binding, which was
+    # `paused: awaiting Albert reply` with a complete report).
+    # `blocked:` deliberately does NOT get this treatment: the contract defines it
+    # as "stuck and needing a decision", and a task with a terminal report is not
+    # stuck — that is the asd-1226 misuse the derivation exists to defeat.
+    if [ "$(_beacon_state "$TASKS/$w/status")" = paused ]; then continue; fi
+    case "$(classify_research "$TASKS/$w")" in
+      ready-for-review|failed)
+        # POSITIVE evidence of completion (report.md frontmatter), not merely an
+        # absence of output — so this does not need the full idle window. A short
+        # floor only guards the race against the report write itself.
+        [ "$quiet_min" -lt "$DONE_QUIET_MIN" ] && continue
+        kill_win "research:$w (report.md kept, classify=done)" "cb:$w" && {
+          queue_ingest "$w"
+          reaped+=("research:$w — classified done. $(ingest_note "$w")"); };;
+      needs-input|blocked|paused)
+        : ;;   # genuinely awaiting Kyle — keep
+      *)
+        # `running` with no terminal report: fall back to the idle-window proxy.
+        [ "$quiet_min" -lt "$WIN_IDLE_MIN" ] && continue
+        kill_win "research:$w (report.md kept, idle ${quiet_min}m)" "cb:$w" && {
+          queue_ingest "$w"
+          reaped+=("research:$w — idle ${quiet_min}m. Report kept at $TASKS/$w/report.md (queued for /ingest if terminal)"); };;
+    esac
+  done < <(tmux list-windows -t cb -F '#{window_name} #{window_activity}' 2>/dev/null)
+fi
+
+# ---- standalone code-conductor sessions ----
+while read -r s sact; do
+  case "$s" in Cerebro|cb|"") continue;; esac
+  protected "$s" && continue
+  wt="$WT_BASE/$s"; [ -d "$wt" ] || continue          # only sessions owning a worktree
+  [ $(( (now - ${sact:-0}) / 60 )) -lt "$WIN_IDLE_MIN" ] && continue   # session active recently → skip
+  # DERIVED, not beacon-read (2026-07-30, second half of the same fix).
+  # classify_code never consults the beacon at all — it keys on the cb-cleanup
+  # `done` marker, `pr.state` (MERGED/DECLINED), `summary.md`, the manifest's
+  # manifest `gate:`/current_task, session liveness, and the OOM/wedge pane
+  # signatures. Strictly better than grepping the beacon for needs-input|blocked,
+  # which is what this branch used to do.
+  cls="$(classify_code "$TASKS/$s")"
+  # A pause declared on the BEACON: pause-via-adopt (kill the session, keep the
+  # worktree, resume with --adopt) is a deliberate Cerebro capability, so honour
+  # it here, before the commit arithmetic, exactly as the research branch does.
+  if [ "$(_beacon_state "$TASKS/$s/status")" = paused ]; then
+    kill_ses "code:$s (paused; worktree kept)" "$s" \
+      && reaped+=("code:$s — paused, worktree kept, resume: cb-resume $s")
+    continue
+  fi
+  case "$cls" in
+    # `paused` here is a pause declared in the MANIFEST (`gate: paused`), which is
+    # a different channel from the beacon arm above and deliberately gets the
+    # gentler treatment: keep. The beacon arm reaps-with-worktree-kept because
+    # `paused:` on the beacon is the agent's own hand-off; a manifest field is the
+    # conductor annotating itself mid-wait, and killing its session off a state
+    # this classifier only just learned to emit is action on an unproven premise.
+    # If the wait really is long, the R6 clock resurfaces it as needs-input.
+    needs-input|blocked|needs-relaunch|paused) continue;;   # awaiting Kyle — keep
+    done|failed)
+      # positive terminal evidence (merged/declined PR, or cb-cleanup's marker) —
+      # reap regardless of commit arithmetic; the worktree is always kept
+      kill_ses "code:$s (classify=$cls; worktree kept)" "$s" \
+        && reaped+=("code:$s — classified $cls, worktree kept, resume: cb-resume $s")
+      continue;;
+  esac
+  # 2026-07-31: fetch BEFORE the commit arithmetic. Every number below is computed
+  # against the last-fetched origin ref, so a stale ref makes pushed work read as
+  # unpushed — the session then never reaps, and the resume note records a wrong
+  # commit count. The kill decision itself is conservative under staleness (an older
+  # ref over-counts `unpushed`, so it declines to reap rather than reaping unsafely),
+  # which is why this was invisible. Non-fatal: reap must still work offline, but the
+  # numbers get stamped unverified so nothing downstream trusts them. See cb-state.
+  _fresh=yes
+  git -C "$wt" fetch origin --quiet 2>/dev/null || _fresh=no
+  [ "$_fresh" = no ] && printf '%s cb-reap: fetch failed for %s — commit counts UNVERIFIED\n' "$(date -Is)" "$s" >> "$CB_HOME/logs/events" 2>/dev/null
+  ahead=$(git -C "$wt" rev-list --count origin/main..HEAD 2>/dev/null || echo 0)
+  # unpushed = local commits NOT on the branch's own origin remote (0 = fully pushed → work safe)
+  br="$(git -C "$wt" branch --show-current 2>/dev/null)"
+  if [ -n "$br" ] && git -C "$wt" rev-parse "origin/$br" >/dev/null 2>&1; then
+    unpushed=$(git -C "$wt" rev-list --count "origin/$br..HEAD" 2>/dev/null || echo "$ahead")
+  else unpushed="$ahead"; fi
+  # NB: the `paused` arm that used to live here is gone — a declared pause is
+  # handled above, before the commit arithmetic.
+  if [ "$ahead" -gt 0 ] && [ "$unpushed" = 0 ]; then
+    _vfy=""; [ "$_fresh" = no ] && _vfy=" ⚠️ counts UNVERIFIED (fetch failed)"
+    kill_ses "code:$s (done+pushed; worktree kept)" "$s" && reaped+=("code:$s — done, $ahead commit(s) pushed to origin, worktree kept$_vfy")
+  elif [ "$ahead" = 0 ] && ! active_devitem "$s"; then
+    kill_ses "code:$s (0 commits/never built; worktree kept)" "$s" && reaped+=("code:$s — never built, worktree kept, fresh re-dispatch if needed")
+  fi
+  # else — unpushed commits (unsafe, keep) OR 0-commit at an active gate (keep)
+done < <(tmux ls -F '#{session_name} #{session_activity}' 2>/dev/null)
+
+# ---- log ----
+if [ "${#reaped[@]}" -gt 0 ] && [ -z "$dry" ]; then
+  log="$VAULT/00 Inbox/$(TZ=America/Denver date +%F)-reaped-sessions.md"
+  { echo ""; echo "## cb-reap sweep $(TZ=America/Denver date +%FT%H:%M)"; for r in ${reaped[@]+"${reaped[@]}"}; do echo "- $r"; done; } >> "$log"
+fi
+[ "${#reaped[@]}" -gt 0 ] && printf 'cb-reap: %d reaped\n' "${#reaped[@]}" || echo "cb-reap: nothing ready to reap"
+exit 0

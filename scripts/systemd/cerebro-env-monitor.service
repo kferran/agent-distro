@@ -1,0 +1,12 @@
+# cerebro-env-monitor.service — one env-error-monitor pass, fired hourly by
+# cerebro-env-monitor.timer. Replaces the session-only Claude cron dda7cb45,
+# which dies when the chat session ends (it did, on 2026-08-05, for hours).
+# Install:
+#   cp scripts/cerebro/systemd/cerebro-env-monitor.{service,timer} ~/.config/systemd/user/
+#   systemctl --user daemon-reload && systemctl --user enable --now cerebro-env-monitor.timer
+[Unit]
+Description=Cerebro env log monitor (hourly, EDJ go-live)
+
+[Service]
+Type=oneshot
+ExecStart=%h/vault/scripts/cerebro/cb-env-monitor-tick

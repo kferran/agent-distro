@@ -1,0 +1,152 @@
+#!/usr/bin/env bash
+# scripts/cerebro/cb-cleanup <slug> [--force] — reap a finished task.
+#   research: kill the cb-session window; the task dir + report stay (ingest
+#             owns the knowledge landing; dirs are reaped manually / M8).
+#   code:     PROTECTED (spec §7 "protect code work") — refuses unless
+#             pr.state=MERGED or --force, and refuses a dirty worktree in
+#             EITHER case (uncommitted work is surfaced, never deleted). Then
+#             git worktree remove + tmux kill-session, mark done, and append
+#             the distill-queue line the ingest skill's code branch consumes
+#             (§8.4 wiki distillation is LLM-proposed, never bash-written).
+set -euo pipefail
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$here/lib/paths.sh"; source "$here/lib/registry.sh"; source "$here/lib/classify.sh"
+
+slug="${1:-}"; force=""
+[ -n "$slug" ] || { echo "usage: cb-cleanup <slug> [--force]" >&2; exit 2; }
+[ "${2:-}" = "--force" ] && force=1
+# R1 (firstmate fm-guard): who-watches-the-watcher rides every command the
+# coordinator runs — warns only (events + coordinator session + push), never blocks.
+"${CB_GUARD_CMD:-$here/cb-guard}" >/dev/null 2>&1 || true
+td="$(cb_task_dir "$slug")"
+tmux="${CB_TMUX_BIN:-tmux}"
+
+if [ "$(_meta_field "$td" kind)" != "code" ]; then
+  # research task: reap the window only
+  "$tmux" kill-window -t "cb:$slug" 2>/dev/null || true
+  echo "cb-cleanup: killed window cb:$slug (task dir + report left for ingest)"
+  exit 0
+fi
+
+wt="$(_meta_field "$td" worktree)"
+jira="$(_meta_field "$td" jira)"
+target="$(_meta_field "$td" target)"
+prstate="$(cat "$td/pr.state" 2>/dev/null || true)"
+
+# pr.state is a CACHE, not the truth. It is written only by cb-pr-check (OPEN on
+# create) and cb-merge (MERGED/DECLINED on the poll), so a PR opened outside that
+# flow — by hand, by a conductor's own ship phase, or before the poll armed —
+# leaves it EMPTY forever. Treating empty as "not merged" silently killed the
+# whole reap path: on 2026-08-07 six worktrees whose PRs were confirmed MERGED on
+# Bitbucket were all refused with pr.state 'none', and merged worktrees simply
+# accumulated. An absent cache means "go look", never "assume unmerged".
+if [ -z "$prstate" ] && [ -z "$force" ] && [ -d "$wt" ]; then
+  _branch="$(git -C "$wt" rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
+  if [ -n "$_branch" ] && [ -r "$HOME/.cerebro/env" ]; then
+    # shellcheck disable=SC1091
+    _tok="$(. "$HOME/.cerebro/env" >/dev/null 2>&1; printf '%s' "${BB_API_TOKEN:-}")"
+    if [ -n "$_tok" ]; then
+      _q="$(printf '%s' "\"$_branch\"" | sed 's|/|%2F|g; s|"|%22|g')"
+      _live="$(curl -s -L --max-time 20 -H "Authorization: Bearer $_tok" \
+        "https://api.bitbucket.org/2.0/repositories/porchsoftware/ultron/pullrequests?q=source.branch.name%3D$_q&state=OPEN&state=MERGED&state=DECLINED&fields=values.state" 2>/dev/null \
+        | python3 -c 'import sys,json
+try:
+    v=json.load(sys.stdin).get("values",[])
+    print("MERGED" if any(x.get("state")=="MERGED" for x in v) else (v[0]["state"] if v else ""))
+except Exception:
+    print("")' 2>/dev/null)"
+      if [ -n "$_live" ]; then
+        echo "cb-cleanup: pr.state was empty — resolved LIVE from Bitbucket for $_branch: $_live" >&2
+        prstate="$_live"
+        # refresh the cache so the next caller does not pay for this again
+        printf '%s' "$_live" > "$td/pr.state" 2>/dev/null || true
+      else
+        echo "cb-cleanup: pr.state empty and the live lookup returned nothing for $_branch — treating as unmerged" >&2
+      fi
+    fi
+  fi
+fi
+
+if [ "$prstate" != "MERGED" ] && [ -z "$force" ]; then
+  echo "cb-cleanup: refusing — $slug pr.state is '${prstate:-none}', not MERGED (unmerged code work is protected; --force to override)" >&2
+  exit 1
+fi
+
+_git() { if [ -n "${CB_GIT_CMD:-}" ]; then eval "$CB_GIT_CMD" '"$@"'; else git "$@"; fi; }
+
+# verify-before-destroy: a dirty worktree is surfaced, never deleted —
+# even under --force.
+if [ -d "$wt" ]; then
+  dirty="$(_git -C "$wt" status --porcelain)"
+  if [ -n "$dirty" ]; then
+    echo "cb-cleanup: refusing — $wt has uncommitted changes:" >&2
+    printf '%s\n' "$dirty" >&2
+    exit 1
+  fi
+  # capture what the resume note needs while the checkout still exists
+  reap_branch="$(_git -C "$wt" rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)"
+  # 2026-08-16: fetch BEFORE the commit arithmetic, mirroring cb-reap:216-225. The
+  # count below is computed against the last-fetched origin ref, so a stale ref makes
+  # pushed work read as unpushed and the resume note — the only audit trail left once
+  # `worktree remove` runs at the end of this block — records a wrong number. cb-reap was
+  # fixed for this on 2026-07-31 (3d85caf7) and the lint guard it shipped with
+  # (cb-reap-fetch.bats:25) caught this line, which arrived a week later at 2f719223.
+  # Non-fatal: cleanup must still work offline, but an unfetched count is stamped so
+  # nothing downstream trusts it.
+  _fresh=yes
+  _git -C "$wt" fetch origin --quiet 2>/dev/null || _fresh=no
+  reap_ahead="$(_git -C "$wt" rev-list --count origin/main..HEAD 2>/dev/null || echo '?')"
+  if [ "$_fresh" = no ]; then
+    # mkdir first: the logs dir is not created until further down, and this file has
+    # already been bitten once by a warning written to a path that did not exist.
+    mkdir -p "$CB_HOME/logs" 2>/dev/null || true
+    printf '%s cb-cleanup: fetch failed for %s — commit counts UNVERIFIED\n' \
+      "$(date -Is)" "$slug" >> "$CB_HOME/logs/events" 2>/dev/null || true
+    echo "cb-cleanup: WARNING fetch failed for $wt — the resume note's commit count is unverified" >&2
+    reap_ahead="$reap_ahead ⚠️ UNVERIFIED (fetch failed)"
+  fi
+  co="$(registry_field "$target" checkout)"; co="${co/#\~/$HOME}"
+  _git -C "${co:-$wt}" worktree remove "$wt"
+fi
+"$tmux" kill-session -t "$slug" 2>/dev/null || true
+printf 'done' | atomic_write "$td/done"
+mkdir -p "$CB_HOME/logs"
+printf '%s %s %s\n' "$(date -Is)" "$slug" "${jira:-}" >> "$CB_HOME/logs/distill"
+
+# RESUME NOTES ARE MANDATORY ON EVERY REAP (Kyle 2026-07-28). This path did not
+# write them for the first ~10 days it existed, and cb-reap did — two reap paths,
+# one compliant. Result: on 2026-08-05 the distill log recorded two reaps "with NO
+# resume-notes line written", and on 2026-08-07 three more went the same way
+# (eja-3781-draft-rules-v2, eja-3854-nyl-cia-joint-lives-failed-qe-fix,
+# eja-hardstop-message-batch) inside 40 minutes. The rule lived in the fleet-tick
+# prompt, which binds the model; nothing bound the script that actually deletes
+# the worktree. Fixing the rule where the destruction happens, not where it is
+# described.
+#
+# The note is written BEFORE nothing — the worktree is already gone by here — but
+# every field it records was captured above while it still existed, and a merged
+# PR is the one case where losing the worktree is safe. What the note preserves is
+# the audit trail: what was destroyed, and how to get it back.
+# VAULT is NOT defined by lib/paths.sh and cb-cleanup never set it — cb-reap
+# defines its own at cb-reap:38. Shipped 2026-08-07 without it, so this path
+# resolved to "/00 Inbox/..." and every write failed. Same defect class the fix
+# was written to close, in my own fix: it failed SILENTLY and in the reassuring
+# direction, because the write was wrapped in 2>/dev/null with a warning to a
+# stderr nobody reads. Four reaps produced zero notes and nothing said so.
+VAULT="${VAULT_DIR:-$HOME/vault}"
+notes="$VAULT/00 Inbox/$(TZ=America/Denver date +%F)-reaped-sessions.md"
+{
+  printf '\n## `%s` — reaped %s (cb-cleanup)\n\n' "$slug" "$(TZ=America/Denver date +%FT%H:%M)"
+  printf -- '- **branch:** `%s` · **PR:** %s · **jira:** %s\n' \
+    "${reap_branch:-unknown}" "${prstate:-unknown}" "${jira:-none}"
+  printf -- '- **commits ahead of origin/main at reap:** %s · **unpushed:** none — cb-cleanup refuses a dirty worktree and only reaps a MERGED PR (or explicit --force).\n' "${reap_ahead:-?}"
+  printf -- '- **preserved:** the task dir `%s` (brief, report, launch line) and the branch on origin. The dev item keeps the knowledge.\n' "$td"
+  printf -- '- **discarded:** the worktree checkout at `%s`, including its `.ai/` scratch.\n' "$wt"
+  printf -- '- **resume:** `scripts/cerebro/cb-start --code --adopt %s --target %s%s`\n' \
+    "$slug" "${target:-ultron}" "${jira:+ --jira $jira}"
+} >> "$notes" || {
+  printf '%s %s resume-notes-WRITE-FAILED path=%s\n' "$(date -Is)" "$slug" "$notes" >> "$CB_HOME/logs/events"
+  echo "cb-cleanup: WARNING could not write resume notes to $notes" >&2
+}
+
+echo "cb-cleanup: reaped $slug (worktree removed, session killed) — distillation queued for ingest"

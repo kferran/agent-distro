@@ -1,0 +1,695 @@
+#!/usr/bin/env bash
+# cb-start --research <slug> [--target <project>]
+#          --code <slug> --target <project> [--jira <KEY>]
+#          --code --adopt <slug> --target <project> [--jira <KEY>] [--worktree <path>]
+#            attach a conductor to an EXISTING worktree (step 15) — see the adopt
+#            branch below.
+set -euo pipefail
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"; source "$here/lib/paths.sh"; source "$here/lib/registry.sh"; source "$here/lib/classify.sh"; source "$here/lib/overlap.sh"; source "$here/lib/xman.sh"
+mode=""; slug=""; target=""; jira=""; adopt=""; worktree=""; force=""; scratch=""; settles=""
+while [ $# -gt 0 ]; do case "$1" in
+  --research) [ $# -ge 2 ] || { echo "cb-start: --research requires a slug" >&2; exit 2; }; mode=research; slug="$2"; shift 2;;
+  --ops) [ $# -ge 2 ] || { echo "cb-start: --ops requires a slug" >&2; exit 2; }; mode=ops; slug="$2"; shift 2;;
+  --scratch) scratch=1; shift;;   # --ops: force a disposable scratch workdir over the vault default
+  --code) mode=code; shift;;
+  --adopt) [ $# -ge 2 ] || { echo "cb-start: --adopt requires a slug" >&2; exit 2; }; adopt=1; slug="$2"; shift 2;;
+  --target) [ $# -ge 2 ] || { echo "cb-start: --target requires a project" >&2; exit 2; }; target="$2"; shift 2;;
+  --jira) [ $# -ge 2 ] || { echo "cb-start: --jira requires a key" >&2; exit 2; }; jira="$2"; shift 2;;
+  --worktree) [ $# -ge 2 ] || { echo "cb-start: --worktree requires a path" >&2; exit 2; }; worktree="$2"; shift 2;;
+  --force) force=1; shift;;   # step 17: override a ticket-identity "already done" refusal
+  # --settles <asking-slug>[:<key>]: this spawn ANSWERS that task's open question.
+  # See _record_settles below for why the spawn is where this belongs.
+  --settles) [ $# -ge 2 ] || { echo "cb-start: --settles requires <asking-slug>[:<key>]" >&2; exit 2; }; settles="$2"; shift 2;;
+  # bare slug after --code (fresh path: `--code <slug>`); --adopt carries its own slug
+  *) if [ "$mode" = code ] && [ -z "$slug" ] && [ -n "$1" ] && [ "${1#-}" = "$1" ]; then slug="$1"; shift;
+     else echo "cb-start: unknown arg $1" >&2; exit 2; fi;; esac; done
+[ -n "$slug" ] || { echo "cb-start: slug required" >&2; exit 2; }
+cb_require_slug "$slug" || exit 2
+# _record_settles — THE ACTIVATION STORY for cross-task settlement.
+#
+# `--settles A[:key]` says: I am spawning this task BECAUSE Kyle answered A's
+# question. The spawn is the one moment that link is known rather than inferred —
+# afterwards nothing in the data connects the two, which is exactly why
+# comms-lookback-distillation's answered question sat open until a human closed
+# it by hand. A `cb-settle` nobody is prompted to run would go unwritten in
+# precisely the way `resolved` already does.
+#
+# Called only on a SUCCESSFUL spawn, and never allowed to fail one: a settlement
+# bookkeeping error must not cost the dispatch. Warn and carry on.
+#
+# NO BLANKET SETTLEMENT FROM THE HOOK. Bare `--settles A` maps to `cb-settle
+# --all`, which is safe only when A has ONE open decision: a spawn that answers
+# one question would otherwise retire every other decision on that task the
+# moment it ships — over-broad settlement on evidence that answers only one of
+# them, which is the brief's central warning in a different coat. cb-send's
+# blanket resolve-on-delivery is not a precedent: there a human typed an answer,
+# here nobody is in the loop for the other keys. So refuse and name the keys,
+# rather than guessing which one was meant.
+_record_settles() {
+  [ -n "$settles" ] || return 0
+  local a="${settles%%:*}" k="" n
+  case "$settles" in *:*) k="${settles#*:}";; esac
+  if [ -z "$k" ]; then
+    n="$(open_decisions "$(cb_task_dir "$a")" 2>/dev/null | grep -c . || true)"
+    if [ "${n:-0}" -gt 1 ]; then
+      echo "cb-start: --settles $a is ambiguous — $a has $n open decisions and no key was named." >&2
+      echo "cb-start: the spawn is fine; settle the specific one with --settles $a:<key>, or cb-settle $a --by $slug --key <key>. Open keys:" >&2
+      open_decisions "$(cb_task_dir "$a")" 2>/dev/null | cut -f1 | sed 's/^/  /' >&2
+      return 0
+    fi
+  fi
+  if [ -n "$k" ]; then
+    "$here/cb-settle" "$a" --by "$slug" --key "$k" || \
+      echo "cb-start: --settles $settles was not recorded (see above); the spawn itself is fine — run cb-settle by hand" >&2
+  else
+    "$here/cb-settle" "$a" --by "$slug" --all || \
+      echo "cb-start: --settles $settles was not recorded (see above); the spawn itself is fine — run cb-settle by hand" >&2
+  fi
+}
+# 2a (2026-07-31): REFUSE a piped payload instead of eating it.
+#
+# cb-start does not read stdin. A brief piped into `cb-start --code --adopt …`
+# was therefore read and DISCARDED by the shell, and cb-start went on to print
+# its ordinary success banner — output byte-identical to a working dispatch. The
+# conductor sat there with no work and no context.md until a human noticed two
+# minutes later. A dispatch must either deliver the brief or fail visibly; a
+# success banner over an unbriefed agent is the defect.
+#
+# Refusing (rather than adopting stdin as the brief) keeps cb-start
+# fire-and-forget, which is what the dispatch skill relies on: consuming a brief
+# here would mean also sending the launch line, which means blocking on the
+# harness composer, and a second briefing path competing with cb-brief.
+#
+# Keyed on BYTES WAITING, not on "stdin is a pipe". An idle open pipe must pass
+# through untouched — cb-send's auto-re-adopt shells out to cb-start from inside
+# cb-watch, and a blunt is-a-pipe refusal would disable that recovery path for
+# reasons having nothing to do with briefs.
+_stdin_has_bytes() {
+  [ -t 0 ] && return 1                      # a terminal is a human, not a payload
+  read -t 0 2>/dev/null || return 1          # nothing readable: no payload waiting
+  # Readable also means EOF (select can't tell them apart), so peek ONE byte.
+  # -d '' so a payload starting with a newline still counts; consuming a byte is
+  # free because every path from here exits.
+  local b; IFS= read -r -d '' -n 1 -t 0.2 b 2>/dev/null
+  [ -n "$b" ]
+}
+if _stdin_has_bytes; then
+  cat >&2 <<EOF
+cb-start: refusing — something was piped to stdin and cb-start does not read it.
+NOTHING was spawned (this used to succeed silently, leaving an unbriefed agent).
+To brief a task: write the brief with cb-brief, then send the launch line with
+cb-send once the harness is up — or let the dispatch skill do both.
+EOF
+  exit 2
+fi
+# R1 (firstmate fm-guard): who-watches-the-watcher rides every command the
+# coordinator runs — warns only (events + coordinator session + push), never blocks.
+"${CB_GUARD_CMD:-$here/cb-guard}" >/dev/null 2>&1 || true
+
+_git() {
+  if [ -n "${CB_GIT_CMD:-}" ]; then eval "$CB_GIT_CMD" '"$@"'; else git "$@"; fi
+}
+
+# _xman_callout SLUG [TMUX_TARGET] [OWN_SESSION] — name the X-Man working this
+# task: persist the pick, show it on the tmux target, echo it.
+#
+# The roster, the deterministic slug→name pick and the tmux display all live in
+# lib/xman.sh (cb-resume and cb-board read the same name from there). What used to
+# be a random cosmetic echo is now durable state — the pick is written to
+# $td/xman and reused for the task's whole life — but it is STILL NOT AN
+# IDENTIFIER: nothing resolves a session, window, branch or dir by it, and
+# sessions and windows keep bare slugs because 29 files target them by exact name.
+#
+# Best-effort, and that is load-bearing rather than decorative now that this
+# touches tmux: every call inside xman_tmux_mark is `|| true`, and the whole
+# callout is guarded here too. This runs AFTER a successful launch under `set -e`,
+# and cb-resume reads any nonzero cb-start status as "adopt failed — no harness,
+# nothing briefed or sent". A cosmetic failure must never manufacture that.
+#
+# OWN_SESSION is passed only for --code, whose session is the task's alone.
+# --ops/--research live in windows of the SHARED `cb` session, where a
+# session-scoped display option would repaint every other running task.
+_xman_callout() {
+  local slug="$1" pick=""
+  pick="$(xman_name "$slug" 2>/dev/null || true)"
+  [ -n "$pick" ] || return 0
+  if [ -n "${2:-}" ]; then xman_tmux_mark "$2" "$pick" "${3:-}" || true; fi
+  echo "🦸 Cerebro dispatches: $pick" || true
+  return 0
+}
+
+# _ticket_precheck KEY SLUG CO BASE FORCE — pre-dispatch ticket-identity dedup
+# (step 17). The slug-only collision check misses "this TICKET is already
+# resolved / in-flight elsewhere" (this session ~5 would-be dup spawns were caught
+# only by hand — ARCH-27/8 RCAs, ARCH-158 merged PR, EJA-3537 open PR, EJA-3538
+# fixed). Read-only + fast. WARN by default; REFUSE (needs --force) only on the
+# strongest "already done" signals: an ARCHIVED-done dev item, a MERGED branch, a
+# MERGED PR. A legit re-spawn / follow-up is common, so open signals just warn.
+# Returns 0 to proceed, 1 to refuse (strong hit, no --force). No KEY → no-op.
+_ticket_precheck() {
+  local key="$1" slug="$2" co="$3" base="$4" force="$5" vault strong=0 f
+  [ -n "$key" ] || return 0
+  vault="${CB_VAULT:-$HOME/vault}"
+  # 1a active dev item elsewhere (filename ~ key, excluding this slug) — WARN
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    [ "$(basename "$f" .md)" = "$slug" ] && continue
+    echo "cb-start: ⚠ $key already has an ACTIVE dev item: $(basename "$f")" >&2
+  done < <(find "$vault/00 Inbox" -maxdepth 1 -type f -iname "*$key*" 2>/dev/null || true)
+  # 1b archived-done dev item — STRONG (already delivered)
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    echo "cb-start: ⚠ $key already has an ARCHIVED (done) dev item: $(basename "$f") — likely already delivered" >&2; strong=1
+  done < <(find "$vault/02 Areas/development/archive/items" -maxdepth 1 -type f -iname "*$key*" 2>/dev/null || true)
+  # 2 RCA / handle doc in the Inbox — WARN
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    echo "cb-start: ⚠ $key already has a doc in the Inbox: $(basename "$f")" >&2
+  done < <(find "$vault/00 Inbox" -maxdepth 1 -type f -iname "*$key*" 2>/dev/null || true)
+  # 3a a remote branch for the key exists — WARN (possible in-flight/dup)
+  _git -C "$co" ls-remote --heads origin 2>/dev/null | grep -iq -- "$key" \
+    && echo "cb-start: ⚠ a branch for $key exists on origin (possible in-flight / duplicate)" >&2
+  # 3b a local branch for the key merged into origin/base — STRONG (already merged)
+  if _git -C "$co" branch --merged "origin/$base" 2>/dev/null | grep -iq -- "$key"; then
+    echo "cb-start: ⚠ a branch for $key is already MERGED into origin/$base — likely already delivered" >&2; strong=1
+  fi
+  # 4 Bitbucket PR referencing the key — best-effort, connection-gated. Only when a
+  # search command is wired; a configured-but-failing search SKIPS with a note (a
+  # dead connection must never block a spawn). CB_PR_SEARCH_CMD echoes OPEN|MERGED.
+  if [ -n "${CB_PR_SEARCH_CMD:-}" ]; then
+    local prstate prc=0
+    prstate="$(eval "$CB_PR_SEARCH_CMD" 2>/dev/null)" || prc=$?
+    if [ "$prc" -ne 0 ]; then
+      echo "cb-start: (ticket PR check skipped — Bitbucket search unavailable/down; not blocking)" >&2
+    else case "$prstate" in
+      *MERGED*) echo "cb-start: ⚠ a MERGED Bitbucket PR references $key — likely already delivered" >&2; strong=1;;
+      *OPEN*)   echo "cb-start: ⚠ an OPEN Bitbucket PR references $key (possible duplicate)" >&2;;
+    esac; fi
+  fi
+  if [ "$strong" -eq 1 ] && [ -z "$force" ]; then
+    echo "cb-start: REFUSING to spawn '$slug' for $key — strong 'already done' signal(s) above. Re-run with --force if this is an intentional re-spawn / follow-up." >&2
+    return 1
+  fi
+  return 0
+}
+
+# _resolve_agent_path — the absolute bin dirs to PREPEND to a spawned agent's
+# PATH (step 16). A tmux-spawned non-login shell doesn't source ~/.bashrc, so the
+# nvm node bin + ~/.local/bin fall off PATH and any node/npx/pipx tool the agent
+# drives (Kusto MCP, context7, stop-hooks) silently ENOENTs. Resolved + baked at
+# WRITE time (same discipline as claude_bin — no runtime nvm/.bashrc). Order:
+# CB_NODE_BIN override → node on PATH now → newest nvm version dir → /usr/local/bin
+# (where the interim host symlinks live). Never hard-fails.
+_resolve_agent_path() {
+  local node_bin nvm_root="${CB_NVM_ROOT:-$HOME/.nvm}" g
+  if [ -n "${CB_NODE_BIN:-}" ]; then
+    node_bin="$CB_NODE_BIN"
+  elif command -v node >/dev/null 2>&1; then
+    node_bin="$(cd "$(dirname "$(command -v node)")" && pwd)"
+  else
+    g="$(ls -d "$nvm_root"/versions/node/*/bin 2>/dev/null | sort -V | tail -1 || true)"
+    node_bin="${g:-/usr/local/bin}"
+  fi
+  printf '%s:%s' "$node_bin" "$HOME/.local/bin"
+}
+
+# _write_conductor_launch TD SLUG JIRA — the shared conductor launch scaffold
+# (launch-line for the dispatch skill to cb-send after context.md is filled +
+# an IDLE --remote-control launch.sh). Used by BOTH the fresh code path and the
+# --adopt path so they stay byte-identical.
+_write_conductor_launch() {
+  local td="$1" slug="$2" jira="$3" claude_bin agent_path
+  printf 'Invoke the ultron:work-conductor skill to drive this work.%s Vault context pre-loaded at .ai/specs/%s/context.md — read that as the Spec input.\n' \
+    "${jira:+ Ticket: $jira.}" "$slug" > "$td/launch-line"
+  claude_bin="${CB_CLAUDE_BIN:-$HOME/.local/bin/claude}"
+  agent_path="$(_resolve_agent_path)"   # step 16: bake a sane PATH for the spawned shell
+  # NO `exec` HERE, and a trailing shell (2026-07-30). `exec` replaces this script
+  # with the harness, so the pane's only process IS the agent: the instant the
+  # agent's turn ends the pane dies and tmux tears the whole session down with it.
+  # Asking a question therefore COSTS THE SESSION — and the fleet contract is "ask
+  # rather than guess", so every well-behaved conductor pays it. Running the
+  # harness as a child and falling through to `exec bash` keeps the session (and
+  # its name, and its worktree binding) alive after the agent exits, so answering
+  # a cb-ask is a re-adopt into the same session instead of a manual rebuild.
+  #
+  # `exec bash` — not a bare `bash` — so the pane ROOT process becomes the shell.
+  # That is what makes the pane readable as dead: cb_pane_proc_state matches the
+  # root comm against CB_DEAD_SHELL_PATTERN, so `bash` reads `dead` and
+  # cb_session_alive reports `gone` (verified live 2026-07-30 — while the harness
+  # runs the subtree walk still finds it and reports `alive`; after it exits the
+  # subtree is just the shell, and the harness's node/MCP children reparent AWAY
+  # rather than holding the session falsely alive).
+  #
+  # THE PANE LEFT BEHIND IS A SHELL, so anything that types at it executes.
+  # cb-send's blind-send path is gated on this same liveness probe for exactly
+  # that reason — do not re-open it.
+  { printf '#!/bin/bash\n'
+    printf 'env PATH="%s:$PATH" %q --remote-control %q\n' "$agent_path" "$claude_bin" "$slug"
+    printf 'exec bash\n'; } > "$td/launch.sh"
+  chmod +x "$td/launch.sh"
+}
+
+# _adopt_exclude_and_mark WT SLUG JIRA — (f)/(a) scope-add #2, for the --adopt
+# path (which never calls cb-brief). Two jobs on a reused worktree:
+#   (f) exclude the WHOLE .ai/ tree via the worktree's info/exclude — broader
+#       than cb-brief's per-slug R14 exclude, because adopted worktrees kept
+#       shipping .ai/ bookkeeping into PRs (seen in #2464). Idempotent.
+#   (a) write the context.md session marker so resolve_run's freshness floor
+#       engages — scoping classify to THIS session's run, not a prior cycle's
+#       stale ship/complete state (eja-3487). Only if absent (never clobber a
+#       richer cb-brief-written one).
+# Raw git (a local op on the real worktree repo — never the CB_GIT_CMD mock);
+# degrades quietly if the worktree isn't a git repo.
+_adopt_exclude_and_mark() {
+  local wt="$1" slug="$2" jira="$3" excl rundir
+  excl="$(git -C "$wt" rev-parse --git-path info/exclude 2>/dev/null || true)"
+  if [ -n "$excl" ]; then
+    ( cd "$wt" && mkdir -p "$(dirname "$excl")" \
+      && { grep -qxF '.ai/' "$excl" 2>/dev/null || printf '%s\n' '.ai/' >> "$excl"; } )
+  fi
+  rundir="$wt/${CB_SPECS_ROOT:-.ai/specs}/$slug"
+  mkdir -p "$rundir"
+  [ -f "$rundir/context.md" ] || printf -- '---\ntask: %s\ntype: code (adopted)\njira: %s\n---\n# Adopted-session marker (cb-start --adopt)\nMarks this session start so resolve_run scopes classification to the current run.\n' \
+    "$slug" "${jira:-none}" > "$rundir/context.md"
+}
+# ensure_scratch_trust ROOT — pre-trust the no-target scratch-worktree ROOT so
+# Claude Code doesn't block launches at the folder-trust dialog (fix 2026-07-14).
+# Claude trusts a dir if it or an ANCESTOR has hasTrustDialogAccepted in
+# ~/.claude.json. Code tasks launch under ~/code (a trusted root) and inherit;
+# no-target research tasks launch under $CB_HOME/worktrees/<slug>, which has no
+# trusted ancestor -> the launch hangs at the dialog until cleared by hand.
+# Seed ONE trusted entry for the scratch root; every child slug inherits it
+# (exactly how ~/code covers ~/code/worktrees/<slug>). Idempotent: writes only
+# when the entry is absent, atomically, under a sidecar flock so it can never
+# clobber a concurrent Claude Code write. Best-effort — never blocks a launch.
+ensure_scratch_trust() {
+  local root="$1"
+  command -v python3 >/dev/null 2>&1 || return 0
+  CB_TRUST_ROOT="$root" CB_TRUST_LOCKDIR="$CB_HOME/locks" python3 - <<'PY' 2>/dev/null || true
+import json, os, fcntl, tempfile
+root = os.environ["CB_TRUST_ROOT"]
+cfg = os.path.join(os.path.expanduser("~"), ".claude.json")
+os.makedirs(os.environ["CB_TRUST_LOCKDIR"], exist_ok=True)
+lockpath = os.path.join(os.environ["CB_TRUST_LOCKDIR"], "claude-json.lock")
+with open(lockpath, "w") as lk:
+    fcntl.flock(lk, fcntl.LOCK_EX)
+    try:
+        with open(cfg) as f:
+            d = json.load(f)
+    except (FileNotFoundError, ValueError):
+        d = {}
+    projs = d.setdefault("projects", {})
+    e = projs.get(root)
+    if isinstance(e, dict) and e.get("hasTrustDialogAccepted") is True:
+        raise SystemExit(0)               # already trusted -> no write
+    projs.setdefault(root, {})["hasTrustDialogAccepted"] = True
+    d_dir = os.path.dirname(cfg) or "."
+    fd, tmp = tempfile.mkstemp(dir=d_dir)
+    with os.fdopen(fd, "w") as f:
+        json.dump(d, f, indent=2)
+    os.replace(tmp, cfg)
+PY
+}
+
+# ---------------------------------------------------------------------------
+# code path (T20): three-surface collision check (spec §7) + registry-driven
+# worktree add + per-slug detached conductor session (ratified 2026-07-12 —
+# preserves the attach/kill-session conventions; the dev-item surface is the
+# dispatch skill's check, it owns the vault side).
+# ---------------------------------------------------------------------------
+if [ "$mode" = "code" ]; then
+  [ -n "$slug" ] || { echo "cb-start: --code requires a slug" >&2; exit 2; }
+  cb_require_slug "$slug" || exit 2
+  [ -n "$target" ] || { echo "cb-start: --code requires --target <project>" >&2; exit 2; }
+  co="$(registry_field "$target" checkout)"; co="${co/#\~/$HOME}"
+  [ -n "$co" ] || { echo "cb-start: --target '$target' has no checkout in the registry" >&2; exit 1; }
+  [ -d "$co" ] || { echo "cb-start: --target '$target' checkout '$co' does not exist" >&2; exit 1; }
+  base="$(registry_field "$target" base)"; : "${base:=main}"
+  prefix="$(registry_field "$target" branch_prefix)"; : "${prefix:=fe/}"
+  branch="$prefix$slug"
+  # T39: the worktree root comes from the ROW, defaulting to ~/code/worktrees.
+  # Both call sites below used to hardcode that path, so `--target cerebro`
+  # (delivery: local-only) built a vault branch inside the Ultron worktree tree.
+  wtroot="$(registry_worktree_root "$target")"
+
+  # --- --adopt: attach a conductor to an EXISTING worktree (step 15) ----------
+  # cb-start --code refuses on the worktree/branch collision; --adopt is the path
+  # for an existing worktree so the always-on cb-watch sees it (no more boardless
+  # hand-launched conductors). Skips the worktree-add + the worktree/branch
+  # collision surfaces; re-baselines the existing worktree first; writes the SAME
+  # meta+beacon a fresh code task writes; launches --remote-control.
+  if [ -n "$adopt" ]; then
+    wtpath="${worktree:-$wtroot/$slug}"
+    [ -d "$wtpath" ] || { echo "cb-start: --adopt worktree $wtpath does not exist (adopt attaches to an EXISTING worktree — use plain --code to create one)" >&2; exit 1; }
+    # idempotent: a live session for the slug -> no-op (never relaunch over a running conductor)
+    # HARNESS liveness, not name presence (2026-07-30). A conductor session now
+    # OUTLIVES its agent by design, so the name survives every turn-end. Keyed on
+    # the name, this guard would read every finished conductor as "already live"
+    # and refuse to re-adopt it — forever. That turns the fix into an outage, so
+    # the question has to be "is an agent running in there?", not "is the name
+    # taken?". A dead-shell session falls through and is relaunched over below;
+    # `unavailable` (cannot tell) keeps the old conservative answer and refuses.
+    if [ "$(cb_session_alive "$slug")" != "gone" ]; then
+      echo "cb-start: session $slug is already live — adopt is a no-op (not relaunching)" >&2
+      exit 0
+    fi
+    # The name is still taken by the dead session (tmux refuses a duplicate
+    # session NAME regardless of what is running inside it), so clear it before
+    # the launch below. Nothing of value is in there: the agent has exited and
+    # the worktree — the thing that actually holds the work — is untouched.
+    if [ "$(cb_session_present "$slug")" = "alive" ]; then
+      eval "${CB_TMUX_KILL_CMD:-tmux kill-session -t \"$slug\"}" >/dev/null 2>&1 \
+        && echo "cb-start: cleared the dead session $slug (harness had exited) before re-adopting" \
+        || echo "cb-start: warn — could not clear the dead session $slug; the launch below may fail on the name collision" >&2
+    fi
+    # (f)/(a): exclude the whole .ai/ tree + drop the context.md session marker
+    _adopt_exclude_and_mark "$wtpath" "$slug" "$jira"
+    # re-baseline first — never silently build on a stale base (this session's
+    # cerebro-build worktree was 80 commits behind). Surface ahead/behind; ff only
+    # when literally on the base branch + clean; otherwise warn, never force.
+    _git -C "$wtpath" fetch origin >/dev/null 2>&1 || echo "cb-start: warn — fetch failed for $wtpath (offline?); proceeding on the local base" >&2
+    behind="$(_git -C "$wtpath" rev-list --count "HEAD..origin/$base" 2>/dev/null || echo 0)"; : "${behind:=0}"
+    ahead="$(_git -C "$wtpath" rev-list --count "origin/$base..HEAD" 2>/dev/null || echo 0)"; : "${ahead:=0}"
+    if [ "$behind" -gt 0 ]; then
+      cur="$(_git -C "$wtpath" rev-parse --abbrev-ref HEAD 2>/dev/null || echo '')"
+      if [ "$cur" = "$base" ] && [ -z "$(_git -C "$wtpath" status --porcelain 2>/dev/null)" ]; then
+        _git -C "$wtpath" merge --ff-only "origin/$base" >/dev/null 2>&1 \
+          && echo "cb-start: adopt re-baselined $slug — fast-forwarded $base to origin/$base ($behind behind)" \
+          || echo "cb-start: warn — $slug was $behind behind origin/$base; ff-only failed, build may be on a stale base" >&2
+      else
+        echo "cb-start: warn — $slug is $behind behind origin/$base (ahead $ahead) on '$cur'; re-baseline before building (not auto-ffing a feature branch / dirty tree)" >&2
+      fi
+    else
+      echo "cb-start: adopt $slug — worktree up to date with origin/$base (ahead $ahead)"
+    fi
+    td="$(cb_task_dir "$slug")"; mkdir -p "$td"
+    _write_conductor_launch "$td" "$slug" "$jira"
+    # launch, then meta+beacon — but NEVER roll back the worktree (it's pre-existing)
+    if eval "${CB_TMUX_CMD:-tmux new-session -d -s \"$slug\" -c \"$wtpath\" \"$td/launch.sh\"}" >/dev/null; then
+      printf 'kind=code\nworktree=%s\njira=%s\nsession=%s\ntarget=%s\n' "$wtpath" "$jira" "$slug" "$target" | atomic_write "$td/meta"
+      printf 'running\n' | atomic_write "$td/status"
+      # M6: a (re)launch is a fresh lifecycle — clear any exhausted-wedge counters
+      # so a later genuinely-new wedge episode re-arms remediation from zero.
+      rm -f "$td/remediation-count" "$CB_HOME/beacons/$slug.remediated"
+      echo "cb-start: adopted code task $slug (session=$slug, worktree=$wtpath)"
+      _record_settles
+      # standalone session, this task's own — session-scoped display is safe.
+      # An adopt REUSES the persisted name: a resumed task keeps its identity.
+      _xman_callout "$slug" "$slug" own
+      exit 0
+    else
+      rm -f "$td/launch.sh"
+      echo "cb-start: failed to launch adopted $slug (worktree left intact)" >&2
+      exit 1
+    fi
+  fi
+
+  wtpath="$wtroot/$slug"
+  # surface 1: worktree dir
+  [ -e "$wtpath" ] && { echo "cb-start: worktree $wtpath already exists" >&2; exit 1; }
+  # surface 2: branch, local + remote
+  [ -n "$(_git -C "$co" branch --list "$branch")" ] && { echo "cb-start: local branch $branch already exists" >&2; exit 1; }
+  [ -n "$(_git -C "$co" ls-remote --heads origin "$branch")" ] && { echo "cb-start: branch $branch already exists on the remote" >&2; exit 1; }
+  # surface 3: live per-slug tmux session.
+  # HARNESS liveness, not name presence (2026-07-30) — see the --adopt guard above
+  # for why. A session now outlives its agent, so a name-keyed refusal here would
+  # block re-spawning any slug that had ever run.
+  #
+  # Refuse ONLY on a positive `alive`: a real conductor is working in there.
+  # `unavailable` (no tmux to ask) falls through exactly as the name-only check
+  # did — it was never a refusal either.
+  [ "$(cb_session_alive "$slug")" = "alive" ] && { echo "cb-start: tmux session $slug already exists" >&2; exit 1; }
+  # Harness dead but the NAME still taken: clear it HERE, before the mutating
+  # worktree add below. tmux refuses a duplicate session name whatever is running
+  # inside it, so leaving it would fail the launch at :~300 — after the worktree
+  # and branch were already created — and drop us into the rollback path.
+  if [ "$(cb_session_present "$slug")" = "alive" ]; then
+    eval "${CB_TMUX_KILL_CMD:-tmux kill-session -t \"$slug\"}" >/dev/null 2>&1 \
+      && echo "cb-start: cleared the dead session $slug (harness had exited) before spawning" \
+      || { echo "cb-start: could not clear the dead session $slug — refusing rather than creating a worktree the launch cannot use" >&2; exit 1; }
+  fi
+
+  # step 17: ticket-identity dedup — is this TICKET already resolved / in-flight
+  # elsewhere? (Read-only; warns, or refuses a strong "already done" hit unless
+  # --force.) BEFORE the mutating worktree-add. Fresh-code only — --adopt attaches
+  # to the ticket's own worktree, where a hit is expected.
+  _ticket_precheck "$jira" "$slug" "$co" "$base" "$force" || exit 1
+
+  # R5 dispatch serialization — is another LIVE conductor already on these files
+  # or in this subsystem? Distinct from the check above: that one asks whether
+  # the TICKET is already handled, this one asks whether the WORK collides.
+  # Same placement rationale — read-only, before the mutating worktree-add — and
+  # the same --force override. Refuses only on a declared-file overlap; a
+  # subsystem hit warns, because two agents in one area is normal and often fine.
+  cb_overlap_check "$slug" "$target" "$(_ov_item_field "$slug" domain)" "$base" || {
+    [ -n "$force" ] || {
+      echo "cb-start: REFUSING to spawn '$slug' — a live conductor already holds files it declares. Re-run with --force to run them in parallel anyway." >&2
+      exit 1; }
+    echo "cb-start: --force — proceeding into a declared file overlap" >&2
+  }
+
+  _git -C "$co" fetch origin
+  _git -C "$co" worktree add -b "$branch" "$wtpath" "origin/$base"
+
+  td="$(cb_task_dir "$slug")"; mkdir -p "$td"
+  # conductor launch is TWO-STEP (start-then-brief-then-launch, T19/T26): the
+  # session starts an IDLE interactive claude WITH --remote-control (2026-07-14,
+  # Kyle) so the conductor shows in the remote view (claude.ai/code + phone),
+  # like research agents — NO prompt is baked in, so the two-step still holds:
+  # the natural-language conductor prompt (dev-README:112 pattern) is written
+  # to launch-line for the dispatch skill to `cb-send` AFTER it has filled
+  # context.md. Sending the prompt at session-create would race the
+  # conductor's context.md read against the skill's fill.
+  _write_conductor_launch "$td" "$slug" "$jira"
+  # beacon + meta only after a successful launch (same discipline as research)
+  if eval "${CB_TMUX_CMD:-tmux new-session -d -s \"$slug\" -c \"$wtpath\" \"$td/launch.sh\"}" >/dev/null; then
+    printf 'kind=code\nworktree=%s\njira=%s\nsession=%s\ntarget=%s\n' "$wtpath" "$jira" "$slug" "$target" | atomic_write "$td/meta"
+    printf 'running\n' | atomic_write "$td/status"
+    # M6: a (re)launch is a fresh lifecycle — clear any exhausted-wedge counters
+    # so a later genuinely-new wedge episode re-arms remediation from zero.
+    rm -f "$td/remediation-count" "$CB_HOME/beacons/$slug.remediated"
+    echo "cb-start: spawned code task $slug (session=$slug, worktree=$wtpath, branch=$branch)"
+    _record_settles
+    _xman_callout "$slug" "$slug" own
+    exit 0
+  else
+    # roll back the worktree + branch created just above — the launch never
+    # started, so the branch carries no commits (force-remove/-D is safe here)
+    # and leaving them behind would wedge the slug: retry hits the surface-1
+    # "worktree exists" refusal and cb-cleanup can't reap a task with no meta.
+    _git -C "$co" worktree remove --force "$wtpath" 2>/dev/null || true
+    _git -C "$co" branch -D "$branch" 2>/dev/null || true
+    rm -f "$td/launch.sh"
+    echo "cb-start: failed to launch $slug (rolled back worktree + branch)" >&2
+    exit 1
+  fi
+fi
+# ---------------------------------------------------------------------------
+# ops path (2026-07-17): the write/ops board-agent lane — vault-maintenance
+# sweeps, reporting runs, approved ops-batches. NOT code-conductor work, NOT
+# read-only research. Board-visible via a `cb` window (identical launch
+# mechanics to research: --remote-control + status beacon + report.md terminal
+# signal), so `classify` (kind != code → classify_research), cb-board,
+# cb-watch, and cb-cleanup all handle it with no change. The one difference is
+# the launch PROMPT (write-allowed within scope; no commit/push; no unapproved
+# outward writes) and the default workdir (the vault, not a scratch dir).
+# Additive — the research tail below is untouched. Kept self-contained (its
+# own launch block) rather than folded into the research tail so the existing
+# read-only path can never accidentally pick up the write contract.
+# ---------------------------------------------------------------------------
+if [ "$mode" = "ops" ]; then
+  [ -n "$slug" ] || { echo "cb-start: --ops requires a slug" >&2; exit 2; }
+  cb_require_slug "$slug" || exit 2
+  td="$(cb_task_dir "$slug")"
+  # workdir: --scratch (pure ops, disposable) > --target checkout (repo-touching
+  # ops) > the vault (default — vault edits + Inbox reporting). No silent
+  # fallback to scratch on an unresolved --target (mirrors the research tail).
+  if [ -n "$scratch" ]; then
+    workdir="$CB_HOME/worktrees/$slug"; mkdir -p "$workdir"
+    ensure_scratch_trust "$CB_HOME/worktrees"
+  elif [ -n "$target" ]; then
+    co="$(registry_field "$target" checkout)"; co="${co/#\~/$HOME}"
+    [ -n "$co" ] || { echo "cb-start: --target '$target' has no checkout in the registry" >&2; exit 1; }
+    [ -d "$co" ] || { echo "cb-start: --target '$target' checkout '$co' does not exist" >&2; exit 1; }
+    workdir="$co"
+  else
+    workdir="${CB_VAULT:-$HOME/vault}"
+    [ -d "$workdir" ] || { echo "cb-start: ops vault workdir '$workdir' does not exist" >&2; exit 1; }
+  fi
+  # collision: a live window for the slug (the cb-session window is the ops
+  # agent's home, same as research). No stale-beacon dance — an ops task is a
+  # one-shot from an intake claim; just archive a stale terminal report so a
+  # re-dispatch can't be instantly classified ready-for-review off old data.
+  list_windows() { eval "${CB_WINDOW_LIST_CMD:-tmux list-windows -t cb -F '#{window_name}' 2>/dev/null || true}"; }
+  list_windows | grep -Fqx "$slug" && { echo "cb-start: tmux window cb:$slug exists" >&2; exit 1; }
+  mkdir -p "$td"
+  [ -f "$td/report.md" ] && mv -f "$td/report.md" "$td/report.prev.md"
+  # ops launch prompt — the guardrail (the crux) lives here: write within scope,
+  # never make an unapproved outward write. Appends the dispatch-skill-written
+  # brief.md (task specifics + declared write-scope).
+  #
+  # LANDING (2026-07-31). Commit/push is NOT a blanket ban — it is read from the
+  # brief's `# Landing` section. A brief that says "commit and push" gets a contract
+  # that permits it; anything else defaults to leave-it-in-the-worktree. The blanket
+  # ban was overriding briefs that Kyle had explicitly asked to land, so the work
+  # stopped one step short and he did the last mile by hand. Merging a PR and posting
+  # outward stay banned regardless — those are his, always.
+  # `|| true` matters: a brief may not exist (fresh spawn, or a test fixture), and a
+  # bare failing command substitution aborts under `set -e`.
+  _landing="$(sed -n '/^# Landing/,/^# /p' "$td/brief.md" 2>/dev/null || true)"
+  if printf '%s' "$_landing" | grep -qiE 'commit and push|commit \+ push|push to'; then
+    _land_rule="- LANDING — YOUR BRIEF SAYS COMMIT AND PUSH: do the work, commit it, and push to the branch your brief names. The pre-push hook is the test gate; if it rejects, fix the cause or report it — do not bypass it with --no-verify. NEVER merge a PR. If your brief also names things to hold back, honour that split and say in your report what you landed vs held."
+  elif printf '%s' "$_landing" | grep -qiE 'commit locally|do not push|local'; then
+    _land_rule="- LANDING — COMMIT LOCALLY, DO NOT PUSH: commit your work with explicit paths (never 'git add -A' — other agents may be writing this repo). Do not push; Kyle reviews and pushes."
+  else
+    _land_rule="- NO COMMIT/PUSH: never run git commit, git push, or any git write command. Leave changes in the working tree for Kyle to review and push."
+  fi
+  prompt="You are a Cerebro ops agent for task '$slug'. You perform a bounded write/ops task (a vault edit, a reporting run, or an approved ops-batch) — NOT code-conductor work and NOT read-only research.
+Rules:
+- WRITE SCOPE: create/edit files ONLY within the scope your brief declares (typically the vault). Never touch anything outside that scope.
+${_land_rule}
+- NO UNAPPROVED OUTWARD WRITES: never post to Jira, Slack, Bitbucket (PRs), or email, and never transition a ticket, unless your brief explicitly records that Kyle approved a SPECIFIC batch — then execute ONLY what was approved.
+- SUPERVISE-ONLY: on any decision your brief doesn't cover, or any outward write not pre-approved, append 'blocked: <what you need from Kyle>' to your beacon and stop rather than guessing.
+Status beacon: append ONE line to '$td/status' on each material phase change — '{state}: {one line}', state one of running/paused/blocked. Use 'blocked: <what you need>' for a human gate (e.g. awaiting outward-write approval).
+Deliverable: '$td/report.md', and nothing else. Put the FULL durable output inside it and write its frontmatter (status: complete|partial|failed, finished: <iso>) as your terminal signal. YOUR DESTINATION IS ALREADY DECIDED — you do not propose one, and you do not file your own copy anywhere in the vault. The path was computed when this task was scaffolded and is printed in your brief's \`deliverable:\` frontmatter field; \`cb-land\` files your report into the vault Inbox ('00 Inbox/') at that exact path once its status is terminal. So writing an Inbox copy yourself produces TWO files for one finding, and it collides with the path already reserved for you — the landing then refuses rather than overwrite it. A \`deliverable:\` you write into your own report is IGNORED; it changes nothing about where your finding lands, which is why you no longer have to get it right. (This is separate from the files your brief's write-scope asks you to edit: make those edits as instructed. It is the REPORT that lands by itself.)
+Invoke any skill by natural language, not slash commands. Brief follows:
+$(cat "$td/brief.md" 2>/dev/null || true)"
+  claude_bin="${CB_CLAUDE_BIN:-$HOME/.local/bin/claude}"
+  agent_path="$(_resolve_agent_path)"   # step 16: bake a sane PATH for the spawned shell
+  {
+    printf '#!/bin/bash\n'
+    printf 'exec env PATH="%s:$PATH" %q --remote-control %q %q\n' "$agent_path" "$claude_bin" "$slug" "$prompt"
+  } > "$td/launch.sh"
+  chmod +x "$td/launch.sh"
+  # ensure the dedicated "cb" tmux session (race-safe, same as the research
+  # tail); skipped entirely under a CB_TMUX_CMD override so tests never touch tmux.
+  if [ -z "${CB_TMUX_CMD:-}" ]; then
+    tmux has-session -t cb 2>/dev/null || tmux new-session -d -s cb 2>/dev/null || true
+    tmux has-session -t cb 2>/dev/null || { echo "cb-start: cannot ensure cb session" >&2; rm -f "$td/launch.sh"; exit 1; }
+  fi
+  if eval "${CB_TMUX_CMD:-tmux new-window -t cb: -n \"$slug\" -c \"$workdir\" \"$td/launch.sh\"}" >/dev/null; then
+    # meta kind=ops: routes classify → classify_research (kind != code) AND
+    # gives the board/ingest provenance that this was an ops (not research) run.
+    #
+    # PRESERVE deliverable=. The ops lane is brief-then-start (dispatch
+    # SKILL.md:244), so cb-brief --ops stamps the computed landing path into
+    # meta first and this atomic_write replaces the WHOLE file. Without carrying
+    # the line across, every ops task would lose its scaffold-time destination
+    # here and the lander would fall back to recomputing — with a date that is
+    # whenever the lander happened to run, not when the task was scaffolded.
+    # `if`, not `&& printf`: as the last command of a `{ } | atomic_write`
+    # group a false test fails the pipeline under pipefail.
+    _deliv_line="$(grep -m1 '^deliverable=' "$td/meta" 2>/dev/null || true)"
+    {
+      printf 'kind=ops\nworkdir=%s\nsession=%s\n' "$workdir" "$slug"
+      if [ -n "$_deliv_line" ]; then printf '%s\n' "$_deliv_line"; fi
+    } | atomic_write "$td/meta"
+    printf 'running\n' | atomic_write "$td/status"
+    echo "cb-start: spawned ops task $slug (workdir=$workdir)"
+    _record_settles
+    # a WINDOW in the shared cb session — window-scoped display only
+    _xman_callout "$slug" "cb:$slug"
+    exit 0
+  else
+    rm -f "$td/launch.sh"
+    echo "cb-start: failed to launch ops $slug" >&2
+    exit 1
+  fi
+fi
+# collision pre-check (spec §7): "already running", not "task dir exists" —
+# cb-brief creates the task dir + brief.md before cb-start runs, so a bare
+# task dir is expected, not a collision.
+td="$(cb_task_dir "$slug")"
+# window list: bare slugs, one per line — windows live in the dedicated "cb"
+# tmux session, named by slug (not "cb:<slug>"); "|| true" so a missing cb
+# session yields an empty list rather than a set -e death.
+list_windows() { eval "${CB_WINDOW_LIST_CMD:-tmux list-windows -t cb -F '#{window_name}' 2>/dev/null || true}"; }
+list_windows | grep -Fqx "$slug" && { echo "cb-start: tmux window cb:$slug exists" >&2; exit 1; }
+# beacon=running no longer refuses on its own — the window-collision check
+# above already refuses whenever the window is genuinely alive. A beacon
+# stuck on "running" with no live window is stale (crashed launch, killed
+# window, etc.): log it and re-dispatch rather than permanently blocking
+# slug reuse.
+# The beacon is append-only (R9): a non-terminal last-line state (running /
+# paused / blocked — anything not a terminal report) is a live-looking beacon
+# left by a prior dispatch. Read the last-line state, not a bare == "running"
+# match, which the launch word satisfies but an appended `running: …` line does
+# not — so a beacon that agents actually wrote to would otherwise skip the
+# stale-redispatch archive below.
+beacon_state="$(_beacon_state "$td/status" 2>/dev/null || true)"
+if [ -f "$td/status" ] && [[ "$beacon_state" =~ ^(running|paused|blocked)$ ]]; then
+  stale_msg="cb-start: stale beacon, re-dispatching $slug"
+  # A stale beacon means agents never rewrite the status file, so a completed
+  # run's report.md is still sitting here from the PRIOR dispatch. If we don't
+  # clear it, classify_research will read that old terminal report and
+  # instantly classify this re-dispatch as ready-for-review/failed off stale
+  # data — archive it (don't delete) so the artifact survives.
+  if [ -f "$td/report.md" ]; then
+    mv -f "$td/report.md" "$td/report.prev.md"
+    stale_msg="$stale_msg (archived prior report.md -> report.prev.md)"
+  fi
+  echo "$stale_msg" >&2
+fi
+# target resolution (spec §6.1): reuse checkout, else scratch dir.
+# Three explicit cases — no silent fallback to scratch when --target is given:
+#   1. no --target            -> scratch path, mkdir it
+#   2. --target -> checkout   -> reuse it; error if the checkout dir is missing
+#   3. --target -> no checkout (unknown project / no checkout field) -> error
+if [ -n "$target" ]; then
+  co="$(registry_field "$target" checkout)"; co="${co/#\~/$HOME}"
+  if [ -z "$co" ]; then
+    echo "cb-start: --target '$target' has no checkout in the registry" >&2
+    exit 1
+  fi
+  [ -d "$co" ] || { echo "cb-start: --target '$target' checkout '$co' does not exist" >&2; exit 1; }
+  workdir="$co"
+else
+  workdir="$CB_HOME/worktrees/$slug"
+  mkdir -p "$workdir"
+  # pre-trust the scratch root so the launch doesn't hang at the folder-trust
+  # dialog (no trusted ancestor otherwise — unlike code tasks under ~/code).
+  ensure_scratch_trust "$CB_HOME/worktrees"
+fi
+mkdir -p "$td"
+# launch script: real research-agent launch, mirroring the vault's conductor
+# launch pattern. The brief is interpolated into the prompt at script-WRITE
+# time; printf %q shell-quotes slug + prompt so any quotes/backticks in the
+# brief can't break launch.sh when it's later executed.
+prompt="You are a Cerebro research agent. You are STRICTLY READ-ONLY EVERYWHERE — the vault, the code checkout, and the entire filesystem. The ONLY file you may create or modify is your report, and it goes at EXACTLY this absolute path: $td/report.md — the Cerebro task dir. Write there and ONLY there: NOT in your working directory, NOT in the code checkout, NOT an invented task slug, NOT relative to cwd. (Your working directory may itself be the code checkout — do not write report.md there; use the absolute $td/report.md path.) Never write, edit, or create ANY other file: NOT in the vault (03 Resources/, 02 Areas/, 01 Projects/, 00 Inbox/, People/, anywhere), NOT in the code checkout; never modify code, never commit, never push, never run any git write command. If your brief's Definition of Done says a finding \"lands\" in a vault page (a 03 Resources/ doc, a wiki, a project overview), you still do NOT write that file — the landing happens after you finish, and the full finished content belongs INSIDE $td/report.md so it is there to be landed. Read your brief and produce your findings in $td/report.md (frontmatter: status: complete|partial|failed, confidence, from_commit, finished, promote_to: none|code) when done. YOUR DESTINATION IS ALREADY DECIDED — you do not propose one. The path was computed when this task was scaffolded and is printed in your brief's \`deliverable:\` frontmatter field; \`cb-land\` files your report there verbatim once its status is terminal. That means: write report.md and nothing else, and do not spend a turn choosing a vault path. A \`deliverable:\` you write into your own report is IGNORED — it changes nothing about where your finding lands, which is exactly why you no longer have to get it right. Invoke any skill by natural language, not slash commands. Brief follows:
+$(cat "$td/brief.md" 2>/dev/null || true)"
+# resolve the claude binary at script-WRITE time and bake the resolved path
+# into launch.sh — not a runtime ${CB_CLAUDE_BIN:-...} lookup, so launch.sh
+# behaves the same no matter what env it's later executed under (tmux window).
+claude_bin="${CB_CLAUDE_BIN:-$HOME/.local/bin/claude}"
+agent_path="$(_resolve_agent_path)"   # step 16: bake a sane PATH for the spawned shell (node/npx/pipx bins)
+{
+  printf '#!/bin/bash\n'
+  printf 'exec env PATH="%s:$PATH" %q --remote-control %q %q\n' "$agent_path" "$claude_bin" "$slug" "$prompt"
+} > "$td/launch.sh"
+chmod +x "$td/launch.sh"
+# attempt the launch BEFORE writing the running beacon — a failed launch
+# must not leave a stuck beacon (collision pre-check refuses when the window
+# is genuinely alive).
+# real launch path only: ensure the dedicated "cb" tmux session exists before
+# opening a window in it. Skipped entirely under a CB_TMUX_CMD override — tests
+# must never touch real tmux.
+# Race-safe: two concurrent cb-starts can both see "no session" and both race
+# `tmux new-session`; the loser's `new-session` exits non-zero ("duplicate
+# session") which would die under set -e. Swallow that failure and hard
+# re-check afterward — if the session still doesn't exist, something other
+# than a benign race is wrong, so bail loudly instead of launching into a void.
+if [ -z "${CB_TMUX_CMD:-}" ]; then
+  tmux has-session -t cb 2>/dev/null || tmux new-session -d -s cb 2>/dev/null || true
+  tmux has-session -t cb 2>/dev/null || { echo "cb-start: cannot ensure cb session" >&2; rm -f "$td/launch.sh"; exit 1; }
+fi
+if eval "${CB_TMUX_CMD:-tmux new-window -t cb: -n \"$slug\" -c \"$workdir\" \"$td/launch.sh\"}" >/dev/null; then
+  printf 'running\n' | atomic_write "$td/status"
+  echo "cb-start: spawned $slug (workdir=$workdir)"
+  _record_settles
+  # research: also a window in the shared cb session
+  _xman_callout "$slug" "cb:$slug"
+else
+  rm -f "$td/launch.sh"
+  echo "cb-start: failed to launch $slug" >&2
+  exit 1
+fi

@@ -1,0 +1,270 @@
+#!/usr/bin/env bash
+# scripts/cerebro/cb-intake --tick — hourly autonomous intake (T32, spec
+# §8.6). Scans the dev-item queue for `status: queued` items whose repo maps
+# to a deliverable registry row, claims atomically (flock + re-check; the
+# claim flip is the ONE sanctioned bash write to the vault, mirroring the
+# dispatch skill's flip), and asks the coordinator to dispatch — the context
+# fill is LLM work, intake only claims + requests. Gates:
+#   focus:  $CB_HOME/mode = focus -> exit 0 silently (suspends intake)
+#   cap:    live agents (research windows + code sessions) < CB_AGENT_CAP
+#           AND memcap_ok (RAM headroom) — else "at capacity" event, exit 0
+#   timing: `timing: overnight` -> not eligible here at all. Those belong to the
+#           night shift's P7 drain; absent (the default) means the hourly tick.
+set -euo pipefail
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$here/lib/paths.sh"; source "$here/lib/registry.sh"; source "$here/lib/memcap.sh"; source "$here/lib/queue.sh"; source "$here/lib/classify.sh"; source "$here/lib/overlap.sh"
+: "${CB_VAULT:=$HOME/vault}"
+items_dir="$CB_VAULT/00 Inbox"
+
+[ "${1:-}" = "--tick" ] || { echo "usage: cb-intake --tick" >&2; exit 2; }
+[ "$(cat "$CB_HOME/mode" 2>/dev/null)" = "focus" ] && exit 0
+
+# Cleanliness sweep FIRST (Kyle 2026-07-22 — part of every tick): reap done/idle
+# X-Men, always keeping worktrees + logging a resume note, so freed slots are
+# available to THIS tick's claim below. Isolated — a sweep error never kills the tick.
+"$here/cb-reap" --sweep >/dev/null 2>&1 || true
+
+# Job A: promote Inbox work items + `#queue` daily-note lines to queued dev items
+# FIRST — capture is frictionless and runs regardless of capacity (only dispatch
+# below is capacity-gated). Non-work is left untouched for the /eod routing pass.
+promote_inbox
+
+# Job A2 (P2, 2026-07-31): top the queue up from `drafting` so the fleet is not
+# starved by hand-promotion alone. Runs AFTER promote_inbox and BEFORE the claim
+# below, so anything promoted this tick is claimable on the same tick. Promotes to
+# `queued` only — the claim path, its caps and the dispatch gates are unchanged.
+promote_drafting
+
+# Job A3: the strand janitor (2026-08-02). Recover items a PREVIOUS tick claimed
+# whose `dispatch-request` keystroke never turned into a spawn — the failure the
+# M5#2 guard below cannot see, because send-keys exits 0 whenever tmux hands the
+# byte to the pty, whether or not the TUI read it. Placed here deliberately:
+# AFTER the promoters and BEFORE the claim loop, so an item recovered this tick
+# is claimable on this same tick; and BEFORE the registry preflight, so a broken
+# registry stops new dispatch without also stopping recovery of the old ones.
+reconcile_strands
+
+_fm() { # FILE FIELD — frontmatter value
+  awk -v f="$2" '/^---[[:space:]]*$/{n++; next} n==1 && index($0, f":") == 1 {sub("^" f ":[[:space:]]*",""); sub(/[[:space:]]*$/,""); print; exit}' "$1" 2>/dev/null
+}
+# deliverable_for_repo REPO — the registry project whose repo matches and
+# whose delivery is a deliverable mode; empty otherwise
+deliverable_for_repo() {
+  awk -v r="$1" '
+    /^- project:/ { proj=$3; repo=""; del="" }
+    $1=="repo:" { repo=$2 }
+    $1=="delivery:" { del=$2; if (repo==r && (del=="bitbucket-pr" || del=="local-only")) { print proj; exit } }
+  ' "$CB_REGISTRY"
+}
+list_windows() { eval "${CB_WINDOW_LIST_CMD:-tmux list-windows -t cb -F '#{window_name}' 2>/dev/null || true}"; }
+
+# live agents = research windows in the cb session + live code sessions
+live_agents() {
+  local n=0 d s
+  # Exclude the cb session's idle base shell window (index 0, a bare shell name
+  # like "bash"): it is NOT a research/ops agent — those are slug-named via
+  # `tmux new-window -n <slug>`. Counting it phantom-consumes a full slot
+  # whenever no research X-Man is running, silently under-dispatching the loop
+  # by 1 (Kyle 2026-07-23 — false-cap fix; surfaced when 5 conductors + the idle
+  # shell hit the cap of 6 and every tick claimed 0).
+  n="$(list_windows | grep -vxE 'bash|-bash|sh|zsh|fish|dash|ash|ksh' | grep -c . || true)"
+  for d in "$CB_HOME"/tasks/*/; do
+    [ -d "$d" ] || continue
+    [ "$(_meta_field "${d%/}" kind)" = "code" ] || continue
+    s="$(_meta_field "${d%/}" session)"; [ -n "$s" ] || s="$(basename "$d")"
+    [ "$(cb_session_alive "$s")" = "alive" ] && n=$(( n + 1 ))
+  done
+  echo "$n"
+}
+
+# collect the eligible queue first (read-only scan). task_type routing
+# (2026-07-17): ops/research items are claimed on `queued` + a valid slug
+# alone (no deliverable-repo gate — an ops sweep or a research run has no PR
+# deliverable). code (the default when task_type is absent) keeps the original
+# gate: a repo that maps to a deliverable registry row. Unknown task_type is
+# skipped, not claimed. The claim loop below is type-agnostic; the dispatch
+# skill reads task_type and picks the matching cb-start mode.
+# REGISTRY PREFLIGHT (2026-07-30) — fail LOUD, never silently claim nothing.
+# On 2026-07-30 `projects.md` was deleted by a commit-all from the Windows clone
+# (`04b8dc38`). `deliverable_for_repo` then matched nothing, so every code item
+# failed the gate below and the tick reported "nothing claimed" — indistinguishable
+# from an empty queue. A broken registry must look like a broken registry.
+# Runs AFTER the reap sweep + promote_inbox so cleanliness and capture still happen.
+if [ ! -f "$CB_REGISTRY" ]; then
+  printf '%s REGISTRY-MISSING %s — code-lane dispatch is DEAD; restore it (git log --diff-filter=D -- <path>)\n' \
+    "$(date -Is)" "$CB_REGISTRY" >> "$CB_HOME/logs/events"
+  echo "cb-intake: FATAL — registry not found at $CB_REGISTRY. Code-lane dispatch is dead." >&2
+  exit 3
+fi
+if [ -z "$(deliverable_for_repo ultron)" ]; then
+  printf '%s REGISTRY-UNRESOLVABLE %s — no deliverable row for repo=ultron; code-lane dispatch is DEAD\n' \
+    "$(date -Is)" "$CB_REGISTRY" >> "$CB_HOME/logs/events"
+  echo "cb-intake: FATAL — registry at $CB_REGISTRY has no deliverable row for repo=ultron." >&2
+  exit 3
+fi
+
+queued=()
+for f in "$items_dir"/*.md; do
+  [ -f "$f" ] || continue
+  [ "$(_fm "$f" status)" = "queued" ] || continue
+  # timing: overnight — P7 (the night shift's one-off drain) claims these, not the
+  # hourly tick. The two sets are disjoint by construction: P7 claims exactly
+  # `status: queued` + `timing: overnight`, this skips exactly that. Design:
+  # 99 Meta/specs/2026-08-15-nightshift-on-the-inbox-queue-design.md.
+  # DELIBERATELY EXPLICIT, not a fall-through: a `task_type: nightshift` would be
+  # skipped today by the unknown-type `*)` arm below, but that is safety by accident —
+  # the next person to add a task type to the router turns a silent skip into a double
+  # claim over one folder, which is the duplicate-scheduler shape at the top of
+  # 02 Areas/Engineering-Work/scheduled-tasks-log.md (184 duplicate events).
+  # Not logged, deliberately, unlike the hold: skip below: a held item is an anomaly
+  # worth an event, an overnight item skipped hourly is the normal case and would
+  # write ~24 events per item per day.
+  #
+  # The inline-comment strip is load-bearing, not defensive tidying. `_fm` is a naive
+  # awk parser that trims whitespace only, so `timing: overnight   # why` yields the
+  # literal `overnight   # why` and an exact-match test fails — while P7, Dataview and
+  # Obsidian are all YAML-semantic and read `overnight`. That splits the two readers
+  # and BOTH claim the item: the hourly tick flips it to active and fires
+  # dispatch-request, which can spawn a worktree an overnight item is never allowed
+  # to have. Strip it here rather than banning comments in the writers, because the
+  # seam has to hold against a hand-edited file too. Scoped to `timing:` on purpose —
+  # `hold:` carries free prose that may legitimately contain a `#`.
+  tim="$(_fm "$f" timing)"; tim="${tim%%#*}"; tim="${tim%"${tim##*[![:space:]]}"}"
+  [ "$tim" = "overnight" ] && continue
+  # hold: IS a gate (2026-07-31). It was not, and that cost twice on 2026-07-28
+  # 19:37: a held EJA-3674 was claimed, and a stale eja-3664 whose PR #2518 was
+  # already open. The workaround was a convention — "anything held belongs at
+  # status: drafting, never queued + hold:" — which is a rule humans and agents
+  # have to remember on every write. Read the field instead.
+  # Deliberately ANY non-empty hold:, with no vocabulary: the point is that a
+  # human (or an agent) wrote a reason down, not that it matched a keyword.
+  if [ -n "$(_fm "$f" hold)" ]; then
+    printf '%s intake skipped %s (hold: %s)\n' \
+      "$(date -Is)" "$(basename "$f" .md)" "$(_fm "$f" hold | cut -c1-80)" >> "$CB_HOME/logs/events"
+    continue
+  fi
+  tt="$(_fm "$f" task_type)"; [ -n "$tt" ] || tt="code"
+  case "$tt" in
+    ops|research) : ;;   # no deliverable-repo gate
+    code)
+      repo="$(_fm "$f" repo)"; [ -n "$repo" ] || continue
+      [ -n "$(deliverable_for_repo "$repo")" ] || continue ;;
+    *) continue ;;       # unknown task_type — skip
+  esac
+  queued+=("$f")
+done
+[ "${#queued[@]}" -gt 0 ] || exit 0
+
+# severity-aware ordering (2026-07-17): claim Blocker -> High -> Medium -> Low ->
+# unranked, filename-alphabetical within a tier (stable tiebreak). So a Blocker
+# always leads the wave from its `severity:` frontmatter — no `bugpush-0-blocker-`
+# filename hack needed. Items without a severity (typically ops/research) rank
+# last but still claim. Tab-delimited so paths with spaces sort cleanly.
+if [ "${#queued[@]}" -gt 1 ]; then
+  mapfile -t queued < <(
+    for f in "${queued[@]}"; do
+      case "$(_fm "$f" severity | tr '[:upper:]' '[:lower:]')" in
+        blocker) r=0 ;; high) r=1 ;; medium) r=2 ;; low) r=3 ;; *) r=4 ;;
+      esac
+      printf '%s\t%s\n' "$r" "$f"
+    done | sort -t"$(printf '\t')" -k1,1n -k2,2 | cut -f2-
+  )
+fi
+
+mkdir -p "$CB_HOME/logs" "$CB_HOME/locks"
+
+tmux="${CB_TMUX_BIN:-tmux}"
+claimed=0
+max_claim="${CB_MAX_CLAIM_PER_TICK:-$(cat "$HOME/.cerebro/max-claim" 2>/dev/null || echo 1)}"   # per-tick claim cap; ~/.cerebro/max-claim overrides (Kyle 2026-07-23: 3 overnight)
+exec 9>"$CB_HOME/locks/intake"
+flock 9
+
+# M5#6 — the budget is computed INSIDE the lock. It used to run above the flock,
+# so two overlapping ticks each read the same pre-lock state, each concluded it
+# held the free slot, and together dispatched past CB_AGENT_CAP; the in-lock
+# re-check below only tests `status: queued`, which bounds per-ITEM double-claim
+# but never the budget. That defeats the RAM headroom gate memcap exists for
+# (the exit-137 OOM history). Whatever else changes here, live/slots/memcap must
+# stay in the critical section — they are read-then-act on shared fleet state.
+live="$(live_agents)"
+slots=$(( CB_AGENT_CAP - live ))
+if [ "$slots" -le 0 ] || ! memcap_ok >/dev/null; then
+  printf '%s intake at capacity (%s queued, %s live)\n' "$(date -Is)" "${#queued[@]}" "$live" >> "$CB_HOME/logs/events"
+  exit 0
+fi
+for f in "${queued[@]}"; do
+  { [ "$claimed" -lt "$slots" ] && [ "$claimed" -lt "$max_claim" ]; } || break
+  # re-check inside the lock — a concurrent tick may have claimed it
+  [ "$(_fm "$f" status)" = "queued" ] || continue
+  slug="$(_fm "$f" slug)"; [ -n "$slug" ] || slug="$(basename "$f" .md)"
+  # skip (don't claim) a malformed slug — it would be interpolated into an
+  # eval'd spawn command downstream; log it rather than kill the whole tick.
+  cb_require_slug "$slug" 2>/dev/null || {
+    printf '%s %s intake-skipped (invalid slug)\n' "$(date -Is)" "$slug" >> "$CB_HOME/logs/events"
+    continue
+  }
+  # R5 serialization — INSIDE the lock, deliberately. Run above the flock it
+  # would rebuild the identical TOCTOU the budget fix just closed: two ticks each
+  # see no overlap, both claim, and the pair collides. Budget, overlap and the
+  # `status: queued` re-check all belong in one critical section.
+  # Intake serializes rather than refuses: a colliding item is LEFT queued and
+  # claimed on a later tick once the other conductor lands. Unattended dispatch
+  # has no one to read a warning, so only a declared-file overlap holds an item —
+  # a same-subsystem warning would stall the queue on a judgement call nobody is
+  # there to make. cb-start still surfaces both to a human at hand-dispatch.
+  # Keep the finding, don't discard it: a deferred item that never un-defers is
+  # opaque otherwise, and Kyle would have to re-run the check by hand to learn
+  # WHO is holding it. cb_overlap_check writes its detail to stderr.
+  ov_rc=0
+  ov_out="$(cb_overlap_check "$slug" "$(deliverable_for_repo "$(_fm "$f" repo)")" "$(_fm "$f" domain)" "${CB_BASE:-main}" 2>&1)" || ov_rc=$?
+  if [ "$ov_rc" -ne 0 ]; then
+    printf '%s %s intake-deferred (R5: declared files held by a live conductor) — %s\n' \
+      "$(date -Is)" "$slug" "$(printf '%s' "$ov_out" | tr '\n' ' ' | sed 's/  */ /g')" >> "$CB_HOME/logs/events"
+    continue
+  fi
+  # Claim marker BEFORE the flip, never after — the ordering is the point. A
+  # marker with no flip is inert (reconcile_strands sees status != active and
+  # drops it); a flip with no marker is a strand nothing can recover, which is
+  # exactly the state this pair of writes exists to make impossible.
+  cb_claim_mark "$slug" "$f"
+  tmp="$(mktemp "$(dirname "$f")/.intake.XXXXXX")"
+  awk 'BEGIN{done=0} /^status: queued[[:space:]]*$/ && !done {print "status: active"; done=1; next} {print}' "$f" > "$tmp"
+  mv -f "$tmp" "$f"
+  # M5#2 — the send is GUARDED, and how far it got decides what happens to the
+  # claim. Unguarded, a failing send aborted the tick under `set -euo pipefail`
+  # with the item left `active` but never dispatched; later ticks skipped it
+  # because it was no longer `queued`, so it was stranded silently and forever.
+  #
+  # Enter as a SEPARATE key event (7/13 cb-send hotfix): a same-burst Enter
+  # into the Claude TUI is read as a newline, leaving the line unsubmitted.
+  if ! "$tmux" send-keys -t "${CB_SESSION:-Cerebro}" "dispatch-request $slug"; then
+    # Nothing reached the coordinator. Roll the claim back so a later tick can
+    # retry it, and stop — a dead coordinator will not get healthier by being
+    # asked again for every remaining item in the queue.
+    tmp="$(mktemp "$(dirname "$f")/.intake.XXXXXX")"
+    awk 'BEGIN{d=0} /^status: active[[:space:]]*$/ && !d {print "status: queued"; d=1; next} {print}' "$f" > "$tmp"
+    mv -f "$tmp" "$f"
+    # the claim is gone, so the marker must go with it — otherwise the janitor
+    # finds a live marker on a `queued` item next tick and has nothing to guard
+    cb_claim_clear "$slug"
+    printf '%s %s dispatch-send-failed (claim rolled back to queued)\n' "$(date -Is)" "$slug" >> "$CB_HOME/logs/events"
+    break
+  fi
+  sleep "${CB_SEND_DELAY:-0.3}"
+  if ! "$tmux" send-keys -t "${CB_SESSION:-Cerebro}" Enter; then
+    # The TEXT landed and may still be submitted — by a later keystroke, or by
+    # Kyle. Rolling back here would re-queue an item whose dispatch can still
+    # fire, which is precisely the double-dispatch this gate exists to prevent.
+    # Hold it `active` and surface it instead; the composer needs a human look.
+    # The claim marker is deliberately KEPT here (do not "fix" this): an active
+    # item whose Enter never landed is the textbook strand, and the janitor —
+    # which re-fires once before giving the claim back — is the right recovery.
+    printf '%s %s dispatch-send-UNCONFIRMED (text delivered, Enter failed — left active; check the coordinator composer)\n' \
+      "$(date -Is)" "$slug" >> "$CB_HOME/logs/events"
+    break
+  fi
+  printf '%s %s intake-claimed (dispatch-request sent)\n' "$(date -Is)" "$slug" >> "$CB_HOME/logs/events"
+  claimed=$(( claimed + 1 ))
+done
+flock -u 9
+[ "$claimed" -gt 0 ] && echo "cb-intake: claimed $claimed item(s)" || true

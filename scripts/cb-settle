@@ -1,0 +1,81 @@
+#!/usr/bin/env bash
+# scripts/cerebro/cb-settle <asking-slug> --by <settling-slug> [--key <key> | --all]
+#
+# Cross-task settlement: record that ASKING-SLUG's open question is answered by
+# the work happening under SETTLING-SLUG.
+#
+# `open_decisions_live` used to consult only the ASKING task's own terminal
+# evidence, so a question asked by task A and answered by shipping task B never
+# closed. Live instance: comms-lookback-distillation asked "build ns-comms-sweep
+# standalone, fold it into Slice C, or hold?"; Kyle answered "standalone"; the
+# work shipped under build-ns-comms-sweep; the asking task had no terminal
+# evidence of its own, so its decision stayed open and cb-digest kept asking.
+# Closed by hand on 2026-08-02 along with five others in the same state.
+#
+# This writes a POINTER, not a close. The key stays in the raw fold — cb-watch
+# and cb-send must keep seeing it, or a later human answer writes no `resolved`
+# and the audit record of that answer is lost — and drops off the board only once
+# the named task has HARD terminal evidence (shipped: cb-cleanup's done marker or
+# a merged PR). A terminal report.md is `soft` and deliberately does NOT settle:
+# a finished report is the normal companion of an unanswered question.
+#
+# So calling this BEFORE the settling task ships is correct and expected. The
+# pointer is a claim about causation ("B is the work that answers A"); the
+# shipping evidence arrives later and is what actually retires the question.
+#
+# Activation: `cb-start --settles <asking-slug>[:<key>]` calls this at spawn —
+# the moment causation is known rather than inferred. Use cb-settle directly for
+# a task already running, or to record the link retroactively.
+set -euo pipefail
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$here/lib/paths.sh"; source "$here/lib/classify.sh"
+
+usage() { echo "usage: cb-settle <asking-slug> --by <settling-slug> [--key <key> | --all]" >&2; exit 2; }
+
+asking="${1:-}"; [ -n "$asking" ] || usage; shift
+by=""; key=""; all=""
+while [ $# -gt 0 ]; do case "$1" in
+  --by)  [ $# -ge 2 ] || usage; by="$2"; shift 2;;
+  --key) [ $# -ge 2 ] || usage; key="$2"; shift 2;;
+  --all) all=1; shift;;
+  *) usage;;
+esac; done
+[ -n "$by" ] || usage
+[ -n "$key" ] || [ -n "$all" ] || { echo "cb-settle: one of --key <key> or --all is required" >&2; exit 2; }
+[ -z "$key" ] || [ -z "$all" ] || { echo "cb-settle: --key and --all are mutually exclusive" >&2; exit 2; }
+
+cb_require_slug "$asking" || exit 2
+cb_require_slug "$by" || exit 2
+[ "$asking" != "$by" ] || { echo "cb-settle: a task cannot settle its own decision — that is what its own terminal evidence is for" >&2; exit 2; }
+
+td="$(cb_task_dir "$asking")"
+[ -d "$td" ] || { echo "cb-settle: no task dir for asking slug '$asking' ($td)" >&2; exit 1; }
+# The settling task must EXIST. Not that it has shipped — the pointer is legal
+# before it does — but a typo'd slug would sit there settling nothing forever,
+# and would be indistinguishable from a task that simply has not shipped yet.
+[ -d "$(cb_task_dir "$by")" ] || { echo "cb-settle: no task dir for settling slug '$by' — check the slug" >&2; exit 1; }
+
+keys=""
+if [ -n "$all" ]; then
+  keys="$(open_decisions "$td" 2>/dev/null | cut -f1)"
+  [ -n "$keys" ] || { echo "cb-settle: $asking has no open decisions — nothing to settle"; exit 0; }
+else
+  case "$key" in *[!0-9]*|'') echo "cb-settle: '$key' is not a decision key (digits)" >&2; exit 2;; esac
+  _is_open "$td" "$key" || { echo "cb-settle: key $key is not open on $asking — nothing to settle" >&2; exit 1; }
+  keys="$key"
+fi
+
+n=0
+while read -r k; do
+  [ -n "$k" ] || continue
+  _decision_settled_by "$td" "$k" "$by"
+  n=$((n + 1))
+done <<EOF
+$keys
+EOF
+
+if [ "$(_task_terminal "$(cb_task_dir "$by")")" = hard ]; then
+  echo "cb-settle: $asking — $n decision(s) settled by $by (already shipped; off the board now)"
+else
+  echo "cb-settle: $asking — $n decision(s) pointed at $by (closes when $by ships)"
+fi

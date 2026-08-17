@@ -1,0 +1,77 @@
+#!/usr/bin/env bash
+# scripts/cerebro/cb-digest — R15 coalesced escalation. The step-12 open-decision
+# set IS the durable buffer; this folds it across all tasks and, when the OLDEST
+# UNDELIVERED open decision has aged past CB_ESCALATE_BATCH_SECS (or catch-up mode
+# is set), delivers ONE pre-read digest line carrying distilled content:
+#   Supervisor escalate (N): <slug: gate> · <slug: gate> … (pre-read)
+# so the coordinator acts without a turn spent re-reading status files.
+#
+# Oldest-not-newest window is load-bearing: a churny fleet must not starve the
+# flush by resetting the window on each new arrival. Per-key delivered-dedup so
+# an unchanged set doesn't re-flush every tick; a NEW open key re-flushes.
+# Delivery + the R16 defer ceiling are the shared cb_escalate path (focus hold,
+# R17 composer guard, R19 sentinel, out-of-band push past the ceiling).
+set -euo pipefail
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$here/lib/paths.sh"; source "$here/lib/push.sh"; source "$here/lib/classify.sh"; source "$here/lib/coordinator.sh"
+: "${CB_ESCALATE_BATCH_SECS:=90}"
+
+sent="$CB_HOME/beacons/digest.sent"       # decision keys already delivered in a digest
+mode="$(cat "$CB_HOME/mode" 2>/dev/null || true)"
+mkdir -p "$CB_HOME/beacons"
+
+# fold the open-decision set across all tasks -> tsv: <iso-ts> <key> <slug> <state> <gate>
+buf="$CB_HOME/beacons/.digest.$$"; : > "$buf"
+trap 'rm -f "$buf" "$buf.s"' EXIT
+for td in "$CB_HOME"/tasks/*/; do
+  [ -d "$td" ] || continue; slug="$(basename "$td")"
+  while IFS=$'\t' read -r ts key state gate; do
+    [ -n "$key" ] && printf '%s\t%s\t%s\t%s\t%s\n' "$ts" "$key" "$slug" "$state" "$gate" >> "$buf"
+  done < <(_open_decisions_aged "$td")
+done
+
+# nothing open -> clear the delivered-set (a fresh set later re-flushes cleanly)
+if [ ! -s "$buf" ]; then rm -f "$sent"; exit 0; fi
+sort -t"$(printf '\t')" -k1,1 "$buf" -o "$buf"    # oldest open first
+
+# prune the delivered-set down to still-open keys (resolved keys must not linger)
+if [ -f "$sent" ]; then
+  cut -f2 "$buf" | sort -u | grep -Fxf - "$sent" > "$buf.s" 2>/dev/null || true
+  mv -f "$buf.s" "$sent"
+fi
+
+# oldest UNDELIVERED open decision (buf is oldest-first) — the window anchor
+oldest_iso=""
+while IFS=$'\t' read -r ts key slug state gate; do
+  grep -qxF "$key" "$sent" 2>/dev/null && continue
+  oldest_iso="$ts"; break
+done < "$buf"
+
+now="$(date +%s)"
+if [ "$mode" = "catch-up" ]; then
+  :   # on-demand: flush the full open set now, ignore the window
+else
+  [ -n "$oldest_iso" ] || exit 0                              # nothing undelivered → no flush
+  age=$(( now - $(date -d "$oldest_iso" +%s 2>/dev/null || echo "$now") ))
+  [ "$age" -ge "$CB_ESCALATE_BATCH_SECS" ] || exit 0          # oldest not aged out yet
+fi
+
+# build the digest of ALL currently-open decisions (deliver as a set)
+n=0; items=""
+while IFS=$'\t' read -r ts key slug state gate; do
+  n=$(( n + 1 )); items="${items:+$items · }$slug: $gate"
+done < "$buf"
+digest="Supervisor escalate ($n): $items (pre-read)"
+
+# defer_age for the R16 ceiling = age of the oldest OPEN decision
+oldest_all="$(head -1 "$buf" | cut -f1)"
+defer_age=$(( now - $(date -d "$oldest_all" +%s 2>/dev/null || echo "$now") ))
+# ceiling-alarm dedup key = the open-key set (content), so a changed set re-arms it
+setkey="$(cut -f2 "$buf" | sort -u | cksum | cut -d' ' -f1)"
+
+# code=decision: the coalesced open-decision set is the `decision` escalation.
+if cb_escalate "$digest" "$defer_age" "$CB_HOME/beacons/digest.defer-alarmed" "$setkey" decision; then
+  cut -f2 "$buf" | sort -u >> "$sent"; sort -u "$sent" -o "$sent"   # mark the whole set delivered
+  [ "$mode" = "catch-up" ] && rm -f "$CB_HOME/mode"                 # catch-up is one-shot
+fi
+exit 0

@@ -1,0 +1,8 @@
+⏺ I need a decision before continuing: which credential-check approach for the
+  FA-Cert FSD — reuse the existing composable or introduce a new slice?
+
+❯ 1. Reuse the EDJAdvisorCredentials composable
+  2. Introduce a new FSD slice
+  3. Let me think about it
+
+  Enter to select · ↑/↓ to navigate · Esc to cancel

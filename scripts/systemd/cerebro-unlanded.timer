@@ -1,0 +1,15 @@
+# cerebro-unlanded.timer — hourly firing for the un-ingested sweep. :52 is an
+# off-minute clear of the other Cerebro jobs (intake at :00, watchlist at :17,
+# env-monitor at :37) so four schedulers never contend for the same tmux send.
+# The tick is cheap and idempotent; the nudge is fingerprint-gated, so an hourly
+# cadence costs nothing when the unlanded set is unchanged.
+[Unit]
+Description=Cerebro un-ingested report sweep schedule (hourly)
+
+[Timer]
+OnBootSec=420
+OnCalendar=*:52:00
+AccuracySec=60
+
+[Install]
+WantedBy=timers.target

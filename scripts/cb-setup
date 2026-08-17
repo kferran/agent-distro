@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+set -euo pipefail
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"; source "$here/lib/paths.sh"
+env_file="${CB_ENV:-$CB_HOME/env}"
+[ -f "$env_file" ] || { echo "cb-setup: missing $env_file (need BB_EMAIL, BB_API_TOKEN)" >&2; exit 1; }
+set -a; . "$env_file"; set +a
+: "${BB_API_TOKEN:?cb-setup: BB_API_TOKEN not set}"
+mkdir -p "$CB_HOME"/{tasks,worktrees,locks,beacons,logs}
+# live token probe (mockable). Credentials go to curl via `--config -` on
+# stdin — the token never appears in argv/ps (ratified 2026-07-12, plan 2
+# gap-audit item 4). The eval'd command string carries no secret; the pipe does.
+# Auth is Bearer: scoped Atlassian API tokens (ATCTT…) 401 on Basic and only
+# accept `Authorization: Bearer` (verified live 2026-07-13); BB_EMAIL stays in
+# the env file as account documentation, not an auth input.
+# `|| true` on the feeder: a probe that exits without reading stdin (a mock,
+# or curl dying early) SIGPIPEs the printf, and under pipefail that would
+# kill the whole script intermittently.
+code="$({ printf 'header = "Authorization: Bearer %s"\n' "$BB_API_TOKEN" || true; } | \
+  eval "${CB_PROBE_CMD:-curl -s -o /dev/null -w '%{http_code}' --config - https://api.bitbucket.org/2.0/repositories/porchsoftware/ultron}")"
+[ "$code" = "200" ] || { echo "cb-setup: token probe failed (HTTP $code) — check the API token/scope" >&2; exit 1; }
+echo "cb-setup: OK ($CB_HOME ready, token valid)"

@@ -1,0 +1,33 @@
+  seam — the coordinator can't deliver a question, can't receive an escalation, and can't create a PR. Worth
+  deciding whether the denial is intentional or an artifact worth a permission rule.
+
+  The 04-ship.md gap is structural, not a one-off. cb-pr-check requires that file, and a conductor that dies at
+  the ship gate never writes it — which is precisely the conductor most likely to have finished its work.
+  Every such run needs a hand-synthesized ship record before it can be shipped. The natural fix is writing
+  04-ship.md when the PR body is built (22:58 here) rather than after the GO, so the artifact exists before the
+  pause that can kill the session.
+
+  12 commits local, unpushed.
+
+✻ Worked for 1m 43s · 3 shells still running
+
+❯ Push
+
+  Running 2 shell commands…
+  ⎿  $ cd /home/kyle/vault; git add board.md && git commit -q -m "board: fleet-tick regeneration" && git fetch
+     -q origin main && echo "behind: $(git rev-list --count main..origin/main)" && echo "ahead: $(git rev-list
+     --count origin/main..main)"
+
+✢ Bunning… (14s · ↓ 4.9k tokens)
+  ⎿  ◻ Explore context: tmux targeting/keystroke code paths + prior Herdr assessment
+     ◻ Disambiguate what "the tmux key id issue" is
+     ◻ Ask remaining clarifying questions one at a time
+     ◻ Propose 2-3 approaches with trade-offs and a recommendation
+     ◻ Present design in sections, get approval per section
+      … +1 pending
+
+───────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ 
+───────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  .  |  main  |  [░░░░░░░░░░] 47%  |  Opus 5                                                               /rc
+  ⏵⏵ auto mode on · 3 shells · ← for agents

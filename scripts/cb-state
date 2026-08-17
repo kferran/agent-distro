@@ -1,0 +1,74 @@
+#!/usr/bin/env bash
+# cb-state [--json] [<slug>...] — the ONE verified read of worktree/branch/PR state.
+#
+# WHY THIS EXISTS. On 2026-07-31 three state claims were reported wrong in a single session
+# (#2513 "unpushed", #2605 "rework unpushed", plus a merged-state miss). Every one came from
+# `git rev-list --count origin/<branch>..HEAD` computed against a remote ref that had not been
+# fetched. The number looks authoritative and is silently stale. A prose rule saying "fetch first"
+# does not fix that — it only fires if the reader remembers. This does the fetch itself, so a
+# stale answer is not reachable through it.
+#
+# CONTRACT: fetch once, then report. Never asserts a state it did not just read.
+set -uo pipefail
+
+MAIN="${CB_MAIN_WORKTREE:-$HOME/code/worktrees/main}"
+WT_ROOT="${CB_WORKTREE_ROOT:-$HOME/code/worktrees}"
+SKIP_RE='^(main|ultron|auth|ironman|playwright-tilt-harness)$'
+json=0; want=()
+for a in "$@"; do case "$a" in --json) json=1;; -*) echo "usage: cb-state [--json] [<slug>...]" >&2; exit 2;; *) want+=("$a");; esac; done
+
+[ -d "$MAIN/.git" ] || [ -f "$MAIN/.git" ] || { echo "cb-state: no main worktree at $MAIN" >&2; exit 1; }
+
+# --- the whole point: one fetch, before any comparison ---
+if ! git -C "$MAIN" fetch origin --quiet 2>/dev/null; then
+  echo "cb-state: FETCH FAILED — refusing to report state from a stale ref" >&2
+  exit 3
+fi
+fetched_at="$(date -Is)"
+main_sha="$(git -C "$MAIN" rev-parse --short origin/main)"
+
+rows=()
+for d in "$WT_ROOT"/*/; do
+  slug="$(basename "$d")"
+  [[ "$slug" =~ $SKIP_RE ]] && continue
+  if [ "${#want[@]}" -gt 0 ]; then
+    printf '%s\n' "${want[@]}" | grep -qxF "$slug" || continue
+  fi
+  br="$(git -C "$d" branch --show-current 2>/dev/null)"
+  [ -n "$br" ] || continue
+
+  has_remote=no; unpushed=""; behind=""; merged=no
+  if git -C "$MAIN" rev-parse --verify -q "origin/$br" >/dev/null 2>&1; then
+    has_remote=yes
+    unpushed="$(git -C "$d" rev-list --count "origin/$br..HEAD" 2>/dev/null)"
+    behind="$(git -C "$MAIN" rev-list --count "origin/$br..origin/main" 2>/dev/null)"
+    git -C "$MAIN" merge-base --is-ancestor "origin/$br" origin/main 2>/dev/null && merged=yes
+  fi
+  ahead="$(git -C "$d" rev-list --count "origin/main..HEAD" 2>/dev/null)"
+  wip="$(git -C "$d" status --porcelain 2>/dev/null | grep -vcE '\.ai/')"
+  conflict=unknown
+  if [ "$has_remote" = yes ]; then
+    if git -C "$MAIN" merge-tree --write-tree origin/main "origin/$br" >/dev/null 2>&1; then conflict=clean; else conflict=CONFLICT; fi
+  fi
+  rows+=("$slug|$br|$has_remote|${unpushed:-NA}|${ahead:-NA}|${behind:-NA}|$merged|$wip|$conflict")
+done
+
+if [ "$json" = 1 ]; then
+  printf '{"fetched_at":"%s","origin_main":"%s","worktrees":[' "$fetched_at" "$main_sha"
+  first=1
+  for r in "${rows[@]}"; do
+    IFS='|' read -r s b hr u a be m w c <<<"$r"
+    [ $first = 1 ] || printf ','; first=0
+    printf '{"slug":"%s","branch":"%s","has_remote":"%s","unpushed":"%s","ahead":"%s","behind":"%s","merged":"%s","wip":%s,"merge":"%s"}' \
+      "$s" "$b" "$hr" "$u" "$a" "$be" "$m" "${w:-0}" "$c"
+  done
+  printf ']}\n'
+else
+  printf 'cb-state — fetched %s · origin/main %s\n\n' "$fetched_at" "$main_sha"
+  printf '%-46s %-8s %-8s %-7s %-7s %-5s %s\n' SLUG UNPUSHED AHEAD BEHIND MERGED WIP MERGE
+  for r in "${rows[@]}"; do
+    IFS='|' read -r s b hr u a be m w c <<<"$r"
+    [ "$hr" = no ] && u="no-remote"
+    printf '%-46s %-8s %-8s %-7s %-7s %-5s %s\n' "$s" "$u" "${a:-NA}" "${be:-NA}" "$m" "${w:-0}" "$c"
+  done
+fi

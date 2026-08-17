@@ -1,0 +1,2 @@
+#!/usr/bin/env bash
+echo "reaped $1" >> /tmp/tmp.vTmux6kaZR/reaped.log

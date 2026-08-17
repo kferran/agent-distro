@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+# scripts/cerebro/cb-merge {--poll|--local} <slug>
+# PR create ≠ merge: Bitbucket merge stays operator-driven and is DETECTED by
+# poll — this script never merges a bitbucket-pr row. --local is the ff merge
+# for `delivery: local-only` rows only. cb-watch's tick calls --poll for every
+# code task with an OPEN pr file, keeping merge detection zero-token bash.
+set -euo pipefail
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$here/lib/paths.sh"; source "$here/lib/registry.sh"; source "$here/lib/classify.sh"
+
+mode="${1:-}"; slug="${2:-}"
+[ -n "$mode" ] && [ -n "$slug" ] || { echo "usage: cb-merge {--poll|--local} <slug>" >&2; exit 2; }
+td="$(cb_task_dir "$slug")"
+[ -f "$td/pr" ] || { echo "cb-merge: no pr file for $slug — cb-pr-check hasn't opened one" >&2; exit 1; }
+read -r id url < "$td/pr" || true
+[ -n "${id:-}" ] || { echo "cb-merge: malformed pr file for $slug" >&2; exit 1; }
+target="$(_meta_field "$td" target)"
+delivery="$(registry_field "$target" delivery)"
+case "$delivery" in
+  bitbucket-pr)
+    adapter="$here/delivery/bitbucket.sh"
+    export CB_BB_WORKSPACE="$(registry_field "$target" workspace)"
+    export CB_BB_REPO="$(registry_field "$target" repo)"
+    ;;
+  local-only) adapter="$here/delivery/local-only.sh";;
+  *) echo "cb-merge: project $target has delivery '$delivery' — not a deliverable row" >&2; exit 1;;
+esac
+
+case "$mode" in
+  --poll)
+    rc=0
+    state="$("$adapter" pr_status "$id")" || rc=$?
+    m401="$CB_HOME/beacons/$slug.seen-401"
+    if [ "$rc" -eq 3 ]; then
+      mkdir -p "$CB_HOME/logs" "$CB_HOME/beacons"
+      # M5#8 (folded into R18): a dead token is polled every tick — log the
+      # escalate ONCE per episode (content-keyed create-if-absent marker), not
+      # once per poll. Still exit 3 each time (the process-level escalate stands).
+      if [ ! -f "$m401" ]; then
+        printf '%s %s escalate (token dead — pr_status 401)\n' "$(date -Is)" "$slug" >> "$CB_HOME/logs/events"
+        : > "$m401"
+      fi
+      echo "cb-merge: escalate — dead token" >&2
+      exit 3
+    elif [ "$rc" -ne 0 ]; then
+      echo "cb-merge: pr_status failed (rc=$rc)" >&2; exit "$rc"
+    fi
+    rm -f "$m401" 2>/dev/null || true   # a live (non-401) poll re-arms the escalate
+    case "$state" in
+      MERGED)
+        printf 'MERGED' | atomic_write "$td/pr.state"
+        mkdir -p "$CB_HOME/logs"
+        printf '%s %s merged (%s)\n' "$(date -Is)" "$slug" "$url" >> "$CB_HOME/logs/events"
+        # hand off to cleanup (worktree remove, session kill, distill queue).
+        # Mockable; a cleanup refusal (dirty worktree) must not mask the merge.
+        eval "${CB_CLEANUP_CMD:-\"$here/cb-cleanup\" \"$slug\"}" || \
+          echo "cb-merge: cleanup deferred for $slug (see cb-cleanup output)" >&2
+        echo "cb-merge: $slug merged"
+        ;;
+      DECLINED)
+        printf 'DECLINED' | atomic_write "$td/pr.state"
+        mkdir -p "$CB_HOME/logs"
+        printf '%s %s declined (%s)\n' "$(date -Is)" "$slug" "$url" >> "$CB_HOME/logs/events"
+        echo "cb-merge: $slug declined — classifier will surface it as failed"
+        ;;
+      OPEN|*) : ;;   # still open — quiet no-op, the poll runs again next tick
+    esac
+    ;;
+  --local)
+    [ "$delivery" = "local-only" ] || { echo "cb-merge: --local refused — $target is $delivery; the operator merges in Bitbucket" >&2; exit 1; }
+    "$adapter" merge "$id"
+    printf 'MERGED' | atomic_write "$td/pr.state"
+    echo "cb-merge: local ff merged $slug"
+    ;;
+  *) echo "usage: cb-merge {--poll|--local} <slug>" >&2; exit 2;;
+esac

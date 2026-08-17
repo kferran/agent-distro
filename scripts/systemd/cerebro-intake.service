@@ -1,0 +1,10 @@
+# cerebro-intake.service — oneshot intake tick (T32), fired hourly by
+# cerebro-intake.timer. Install:
+#   cp scripts/cerebro/systemd/cerebro-intake.{service,timer} ~/.config/systemd/user/
+#   systemctl --user daemon-reload && systemctl --user enable --now cerebro-intake.timer
+[Unit]
+Description=Cerebro hourly intake (queued dev items)
+
+[Service]
+Type=oneshot
+ExecStart=%h/vault/scripts/cerebro/cb-intake --tick

@@ -1,0 +1,24 @@
+  M5#2 guards a send that errors. The strand that note was written about is a
+  swallowed Enter: send-keys returns 0 and the TUI never submits. cb-intake
+  still has no equivalent of cb-send's verify ladder, so nothing confirms the
+  coordinator received the line. The two strands observed 8/1 (one for 11h40m)
+  are that shape and would still happen. I wrote the distinction into
+  scheduled-tasks-log.md rather than let it read as done;
+  cerebro-intake-strand-janitor stays live.
+
+  So on arming: precondition 1 met, precondition 2 partially. Plus the
+  intake-tick cron runs the same cb-intake --tick — arming without dropping its
+  Part 1 doubles the claim rate against max-claim, which is the thing the TOCTOU
+  gates were built to bound.
+
+  hot.md's ★ now reads "arm the timer?" instead of "merge this," carrying both
+  caveats.
+
+✻ Crunched for 11m 13s
+                                         new task? /clear to save 336.2k tokens
+────────────────────────────────────────────────────────────────────────────────
+❯ arm it
+────────────────────────────────────────────────────────────────────────────────
+  vault  |  cerebro/cerebro-remaining-phases  |  [░░░░░░░░░░] 34%  |  Opus 5
+  ⏵⏵ auto mode on (shift+tab to cycle) · install gh for PR status · ← for agen…
+                                                                            /rc

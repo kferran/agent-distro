@@ -1,0 +1,32 @@
+# cerebro-watch.service — the Cerebro watcher process (T27): cb-watch --loop,
+# the zero-token bash tick that classifies tasks, appends events, renders the
+# board, polls open PRs, and nudges the coordinator on needs-input. Install:
+#   cp scripts/cerebro/systemd/cerebro-watch.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload && systemctl --user enable --now cerebro-watch.service
+#   loginctl enable-linger kyle   # survive logout/reboot
+#
+# Unlike the coordinator (cerebro.service — oneshot-ensure, because tmux
+# new-session hands the process to the shared tmux server), the watcher is a
+# plain long-running bash loop that systemd CAN track directly, so a simple
+# service with Restart=always is the right shape here.
+[Unit]
+Description=Cerebro watcher (cb-watch --loop)
+
+[Service]
+# Nothing sources ~/.cerebro/env process-wide. delivery/bitbucket.sh self-sources
+# it for BB_API_TOKEN (bitbucket.sh:18-21) and that is the ONLY variable that
+# reaches a daemon today — so anything else put in that file is invisible to
+# everything running under systemd, silently. CB_PUSH_URL is the case that
+# surfaced it: lib/push.sh reads it from the environment, cb-guard swallows
+# cb_push's unconfigured return with `|| true`, and the tick would have gone on
+# pushing nothing with nothing saying so (spec §9.1, Type B).
+# The leading `-` makes a missing file non-fatal and unlogged, so a fresh clone
+# with no env file still starts.
+EnvironmentFile=-%h/.cerebro/env
+Type=simple
+ExecStart=%h/vault/scripts/cerebro/cb-watch --loop
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target

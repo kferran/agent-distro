@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+# scripts/cerebro/cb-sync — registry-driven repo hygiene (T38): for each
+# registry row with a repo, `git fetch --prune` the canonical checkout, ff its
+# default branch only when clean AND on base, and prune lingering local fe/*
+# branches whose task PRs are MERGED. Never touches live worktrees.
+set -euo pipefail
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$here/lib/paths.sh"; source "$here/lib/registry.sh"; source "$here/lib/classify.sh"
+
+_git() { if [ -n "${CB_GIT_CMD:-}" ]; then eval "$CB_GIT_CMD" '"$@"'; else git "$@"; fi; }
+
+# registry rows that actually have a repo (research-only checkouts without
+# one are skipped)
+mapfile -t projects < <(awk '/^- project:/{p=$3} $1=="repo:"{print p}' "$CB_REGISTRY")
+
+for proj in "${projects[@]:-}"; do
+  [ -n "$proj" ] || continue
+  co="$(registry_field "$proj" checkout)"; co="${co/#\~/$HOME}"
+  [ -d "$co" ] || { echo "cb-sync: $proj checkout $co missing — skipped"; continue; }
+  base="$(registry_field "$proj" base)"; : "${base:=main}"
+  prefix="$(registry_field "$proj" branch_prefix)"; : "${prefix:=fe/}"
+
+  _git -C "$co" fetch --prune origin
+
+  # ff the default branch of the CANONICAL checkout only — and only if it's
+  # clean and actually sitting on base (never yank a WIP branch forward)
+  if [ -n "$(_git -C "$co" status --porcelain)" ]; then
+    echo "cb-sync: $proj checkout dirty — ff skipped"
+  elif [ "$(_git -C "$co" rev-parse --abbrev-ref HEAD)" != "$base" ]; then
+    echo "cb-sync: $proj checkout not on $base — ff skipped"
+  else
+    _git -C "$co" merge --ff-only "origin/$base"
+  fi
+
+  # prune lingering local branches for MERGED task PRs. The task record is
+  # the branch→PR mapping; MERGED pr.state is already poll-confirmed.
+  worktrees="$(_git -C "$co" worktree list --porcelain 2>/dev/null || true)"
+  for td in "$CB_HOME"/tasks/*/; do
+    [ -d "$td" ] || continue
+    [ "$(_meta_field "${td%/}" kind)" = "code" ] || continue
+    [ "$(_meta_field "${td%/}" target)" = "$proj" ] || continue
+    [ "$(cat "${td%/}/pr.state" 2>/dev/null)" = "MERGED" ] || continue
+    branch="$prefix$(basename "$td")"
+    [ -n "$(_git -C "$co" branch --list "$branch")" ] || continue
+    if printf '%s\n' "$worktrees" | grep -Fqx "branch refs/heads/$branch"; then
+      echo "cb-sync: $branch still checked out in a live worktree — not pruned"
+      continue
+    fi
+    _git -C "$co" branch -D "$branch"
+    echo "cb-sync: pruned $branch ($proj, PR merged)"
+  done
+done
+echo "cb-sync: done"

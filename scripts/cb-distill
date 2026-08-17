@@ -1,0 +1,415 @@
+#!/usr/bin/env bash
+# cb-distill {--queue | --check-path <path> | --run | --commit} [--dry-run]
+#   --queue              one `slug<TAB>landed-path` line per landed-not-distilled report
+#   --check-path <path>  0 = the distiller may write there, 2 = refused
+#   --run                scaffold the ops task for the pending set, print the spawn line
+#   --commit             verify the change summary, then make the one `distill:` commit
+#
+# WHY THIS EXISTS. cb-land files a finished report into `00 Inbox/` — which
+# moves the backlog rather than draining it. §7 (reversed by Kyle 2026-08-14:
+# "Auto distillation should happen and a summary of the changes made should be
+# produced") closes the other half: the finding's prose gets integrated into the
+# page that owns it, refined-not-appended, without waiting on a turn of Kyle's
+# attention.
+#
+# WHAT IS BASH AND WHAT IS NOT. Deciding which page owns a finding, and writing
+# the integrated prose, is judgment — it runs as an `--ops` X-Man against
+# `.claude/skills/distill/SKILL.md`. This script is the mechanical half only:
+# the queue, the write gate, the summary-completeness check, and the commit.
+# Append-only was considered and rejected 2026-08-14 — it produces exactly the
+# accretion `02 Areas/platform/CLAUDE.md` exists to prevent.
+#
+# THE SAFETY MODEL IS REVIEW-AFTER, NOT APPROVE-BEFORE — the same trade Kyle
+# already accepted for `/vault-routing`. What makes an in-place prose rewrite
+# safe is the CHANGE SUMMARY: every rewrite reported with its before and after,
+# so a bad integration is visible without opening the diff, and the whole run
+# reverts with `git revert` of one SHA. That argument only holds if the summary
+# is complete — an unverified summary is narration, not a safety mechanism —
+# which is why `--commit` derives what changed from git and REFUSES when the
+# summary does not name it. Never `git add -A`, never a push.
+set -euo pipefail
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$here/lib/paths.sh"       # cb_task_dir / cb_require_slug / atomic_write
+source "$here/lib/land.sh"        # cb_local_date / cb_deliverable_path
+source "$here/lib/denylist.sh"    # cb_is_forbidden — the list cb-ingest uses too
+
+CB_HOME="${CB_HOME:-$HOME/.cerebro}"
+# Same resolution as cb-ingest:44 and cb-land:37 — VAULT_DIR is how every
+# vault-writing script is pointed away from the real vault in tests.
+VAULT="${VAULT_DIR:-$HOME/vault}"
+LOCAL="$(cb_local_date)"          # never inline `TZ=… date`: one place, wave 1
+SUMMARY_REL="00 Inbox/$LOCAL-distill-summary.md"
+SUMMARY="$VAULT/$SUMMARY_REL"
+LOCKDIR="$CB_HOME/locks"
+RUN_SLUG="distill-$LOCAL"
+# The dirty set as it was when `--run` scaffolded the pass. `--commit` subtracts
+# it, which is the one fact that separates "the distiller wrote this" from "this
+# was already dirty" — see the baseline block under --commit for why every other
+# check now depends on it.
+BASELINE="$(cb_task_dir "$RUN_SLUG")/dirty-baseline"
+
+# vault_dirty — every repo-relative path that is modified-tracked or untracked,
+# NUL-separated, UNSCOPED. `-z` on both because vault paths contain spaces and a
+# single non-ASCII byte in a filename turns a line-based read into a silently
+# wrong path list. Scoping happens at the point of use, never here: the baseline
+# has to cover the whole vault or C5's out-of-roots check would fire on every
+# pre-existing dirty file outside the roots and refuse every commit.
+vault_dirty() {
+  { git -C "$VAULT" diff -z --name-only
+    git -C "$VAULT" ls-files -z --others --exclude-standard
+  } | sort -zu
+}
+
+# The destinations §7's table marks ✅. An ALLOWLIST, not a denylist:
+# `cb_is_forbidden` says what may never be written anywhere, this says where the
+# distiller is allowed to write at all. Both gates run, denylist first — which
+# is what keeps a `<root>/CLAUDE.md` out even though its directory is allowed.
+#
+# `02 Areas/platform/` is here because §7's table row reads "`03 Resources/`
+# domain wikis, capability docs" and misprefixes half of it: the capability docs
+# are under `03 Resources/{ultron,ironman}/capabilities/`, but the five DOMAIN
+# WIKIS the row names — and calls "the main distillation target" — live at
+# `02 Areas/platform/<domain>/wiki.md`. The tell is that §7 also requires the
+# distill skill to cite `02 Areas/platform/CLAUDE.md` as its governing
+# write-shape rule; under the literal prefix that rule would govern nothing the
+# distiller may touch. Correcting a misnamed address, not widening a permission.
+#
+# ⚠️ `02 Areas/platform/` ONLY — never bare `02 Areas/`. The area holds
+# Org-Performance, Engineering-Work and the rest, none of which anyone has
+# licensed an automated pass to rewrite.
+ALLOWED_ROOTS=('03 Resources/' '01 Projects/' '02 Areas/platform/' '02 Areas/development/items/')
+
+mode=""; arg=""; dry=""
+while [ $# -gt 0 ]; do case "$1" in
+  --queue)      mode=queue; shift;;
+  --run)        mode=run; shift;;
+  --commit)     mode=commit; shift;;
+  --check-path) [ $# -ge 2 ] || { echo "cb-distill: --check-path requires a path" >&2; exit 2; }
+                mode=check; arg="$2"; shift 2;;
+  --dry-run)    dry=1; shift;;
+  *) echo "cb-distill: unknown arg $1" >&2; exit 2;;
+esac; done
+[ -n "$mode" ] || { echo "usage: cb-distill {--queue|--check-path <path>|--run|--commit} [--dry-run]" >&2; exit 2; }
+
+# --- the write gate ----------------------------------------------------------
+
+# in_allowed_root PATH — 0 if PATH sits under one of §7's three ✅ roots.
+in_allowed_root() {
+  local p="$1" root
+  for root in "${ALLOWED_ROOTS[@]}"; do
+    case "$p" in "$root"?*) return 0;; esac
+  done
+  return 1
+}
+
+# distill_may_write PATH — the whole gate, in one place, so `--check-path` and
+# the commit-time filter can never disagree about what the distiller may touch.
+# Denylist first: it is the one that catches absolute paths and `..`, and
+# `03 Resources/../CLAUDE.md` satisfies the allowlist prefix while resolving to
+# the file the fleet must never rewrite.
+distill_may_write() {
+  local p="${1:-}"
+  [ -n "$p" ] || { echo "cb-distill: empty path" >&2; return 2; }
+  if cb_is_forbidden "$p"; then
+    echo "cb-distill: refused — \`$p\` is on the never-touch list (lib/denylist.sh)" >&2; return 2
+  fi
+  if ! in_allowed_root "$p"; then
+    echo "cb-distill: refused — \`$p\` is outside the distiller's roots (${ALLOWED_ROOTS[*]})" >&2; return 2
+  fi
+  case "$p" in */) echo "cb-distill: refused — \`$p\` is a directory" >&2; return 2;; esac
+  return 0
+}
+
+if [ "$mode" = check ]; then
+  distill_may_write "$arg" || exit 2
+  echo "cb-distill: ok — $arg"
+  exit 0
+fi
+
+# --- the queue ---------------------------------------------------------------
+
+# pending — every task cb-land has filed (`<td>/landed`) whose finding has not
+# been distilled (`<td>/distilled`). STDOUT CONTRACT: one `slug<TAB>path` line
+# per pending task and NOTHING otherwise, so `/eod` can gate on `[ -s ]` /
+# `[ -n "$(…)" ]` without parsing. Human chatter would break that consumer.
+pending() {
+  local td slug
+  for td in "$CB_HOME"/tasks/*/; do
+    [ -d "$td" ] || continue
+    [ -f "$td/landed" ] || continue
+    [ -f "$td/distilled" ] && continue
+    slug="$(basename "$td")"
+    printf '%s\t%s\n' "$slug" "$(cat "$td/landed")"
+  done
+}
+
+if [ "$mode" = queue ]; then
+  pending
+  exit 0
+fi
+
+# --- --run: scaffold the ops task, hand off ----------------------------------
+# Deliberately thin. It does NOT spawn — spawning is the dispatch skill's job,
+# and a script that spawns its own agent has two schedulers. It also does not
+# reimplement the brief writer: wave 5's `cb-brief --ops` owns that shape, and
+# this writes the minimum an ops task needs to be startable and landable.
+if [ "$mode" = run ]; then
+  q="$(pending || true)"
+  [ -n "$q" ] || { echo "cb-distill: nothing landed-and-undistilled — nothing to do"; exit 0; }
+  slug="$RUN_SLUG"
+  cb_require_slug "$slug" || exit 2
+  td="$(cb_task_dir "$slug")"
+  # Refuse rather than overwrite: today's distill task may be mid-run, and
+  # rewriting the brief under a live agent is how a run loses its scope.
+  [ -e "$td/brief.md" ] && { echo "cb-distill: $slug already scaffolded ($td) — resume or remove it" >&2; exit 2; }
+  n="$(printf '%s\n' "$q" | wc -l | tr -d ' ')"
+  if [ -n "$dry" ]; then
+    printf 'cb-distill: WOULD scaffold %s for %s landed report(s)\n' "$slug" "$n"; exit 0
+  fi
+  mkdir -p "$td"
+  deliv="$(cb_deliverable_path ops "$slug")"
+  {
+    printf -- '---\ntask: %s\ntype: ops\nclearance: standard\nstatus: running\nworktree: %s\nreport: %s\ndeliverable: %s\nbeacon: %s\nstarted: %s\n---\n' \
+      "$slug" "$VAULT" "$td/report.md" "$deliv" "$td/status" "$(date -Is)"
+    printf '\n# Objective\n\nDistil the landed reports below into the vault pages that own their findings.\n'
+    printf 'Invoke the `distill` skill — it is the contract for this task.\n\n'
+    printf '# The queue (%s landed report(s))\n\n' "$n"
+    printf '%s\n' "$q" | while IFS="$(printf '\t')" read -r s p; do
+      printf -- '- `%s` — `%s`\n' "$s" "$p"
+    done
+    printf '\n# Scope\n\nIn: prose integration into `%s`.\n' "${ALLOWED_ROOTS[*]}"
+    printf 'Out: `People/`, `Confidential/`, rule surfaces, and anything ambiguous — those are declines, listed in the summary for `/ingest`.\n\n'
+    printf '# Definition of done\n\n'
+    printf -- '- `%s` written. One entry per rewrite, on one line: the destination as `file:line`, a `before:` and an `after:`, both verbatim. `--commit` checks that form.\n' "$SUMMARY_REL"
+    printf -- '- Every report above named in the summary — as a write or as an explicit decline. An unnamed one is a refusal, because committing retires the whole queue.\n'
+    printf -- '- `%s/cb-distill --commit` run and green (it refuses if the summary is incomplete).\n' "$here"
+    printf -- '- Nothing pushed.\n'
+  } | atomic_write "$td/brief.md"
+  # kind=ops routes classify() → classify_research (kind != code) and gives the
+  # board the provenance; deliverable= is the computed landing path, so this
+  # task's own report lands like any other.
+  printf 'kind=ops\nsession=%s\ndeliverable=%s\n' "$slug" "$deliv" | atomic_write "$td/meta"
+  # THE BASELINE. Everything dirty right now belongs to someone else — Kyle
+  # mid-edit, ns-capability-drift's staged doc work, another pass's output — and
+  # `--commit` subtracts this set so none of it is demanded in the summary, none
+  # of it is staged, and none of it is mistaken for a write outside the roots.
+  # Written only when the vault is a git repo; --commit refuses on a non-repo
+  # before it ever looks for this file.
+  if git -C "$VAULT" rev-parse --git-dir >/dev/null 2>&1; then
+    vault_dirty | atomic_write "$BASELINE"
+  fi
+  printf 'cb-distill: scaffolded %s (%s landed report(s))\n' "$slug" "$n"
+  printf 'spawn with: %s/cb-start --ops %s\n' "$here" "$slug"
+  exit 0
+fi
+
+# --- --commit: the summary-completeness check, then the commit ---------------
+[ -d "$VAULT" ] || { echo "cb-distill: no vault at '$VAULT' — nothing to do" >&2; exit 1; }
+git -C "$VAULT" rev-parse --git-dir >/dev/null 2>&1 || {
+  echo "cb-distill: '$VAULT' is not a git repo — refusing to commit" >&2; exit 1; }
+[ -f "$SUMMARY" ] || {
+  echo "cb-distill: no change summary at \`$SUMMARY_REL\` — refusing to commit" >&2
+  echo "  the summary IS the safety mechanism for an in-place rewrite; without it there is nothing to review" >&2
+  exit 2; }
+
+# THE BASELINE, and why a missing one is a refusal rather than a fallback.
+# Without it this script cannot tell its own writes from what was already dirty,
+# and every check below inherits that confusion: pre-existing dirt gets demanded
+# in the summary, the refusal prints its path, and pasting that path commits
+# Kyle's uncommitted work under a `distill:` subject. That was reproduced twice.
+# Falling back to demand-everything would keep the same laundering path open one
+# step further along, so there is no fallback — `--run` is not optional, and
+# /eod's Step 6.13 already runs it before the pass is ever spawned.
+if [ ! -f "$BASELINE" ]; then
+  echo "cb-distill: REFUSED — no run baseline at \`$BASELINE\`" >&2
+  echo "  \`--commit\` subtracts the dirty set \`--run\` recorded; without it this script cannot" >&2
+  echo "  tell its own writes from work that was already in the tree. Run \`cb-distill --run\` first." >&2
+  exit 2
+fi
+declare -A was_dirty=()
+while IFS= read -r -d '' p; do
+  [ -n "$p" ] && was_dirty["$p"]=1
+done < "$BASELINE"
+
+# What actually changed, from git — never from the agent's narration. That is
+# the whole point: an agent that forgets to report a rewrite is exactly the case
+# this check exists to catch, so asking it what it changed would be circular.
+#
+# Three buckets, all baseline-subtracted:
+#   changed[]   — inside the allowed roots: the pass's own writes, each of which
+#                 must carry a before/after entry in the summary.
+#   outside[]   — anywhere else, or denylisted AND hand-maintained: "the
+#                 distiller wrote somewhere it may not", which is C5.
+#   generated[] — a file with a dedicated fleet writer on a timer. Dirty here is
+#                 evidence of that writer, NOT of this pass, so it is noted and
+#                 never refused. See `cb_is_generated_surface` in lib/denylist.sh
+#                 for why the never-touch list splits in two — it is an
+#                 attribution rule, not an exception list, and the write gate is
+#                 unchanged: the distiller may not write any of them.
+# The summary itself lives in `00 Inbox/`, outside the roots, and is written by
+# the pass after `--run` — so it is the one exemption, and a mechanical one.
+changed=(); outside=(); generated=()
+while IFS= read -r -d '' p; do
+  [ -n "${was_dirty[$p]:-}" ] && continue          # already dirty at --run: not ours
+  [ "$p" = "$SUMMARY_REL" ] && continue            # the pass's own deliverable
+  if in_allowed_root "$p" && ! cb_is_forbidden "$p"; then
+    changed+=("$p")
+  elif cb_is_generated_surface "$p"; then
+    generated+=("$p")
+  else
+    outside+=("$p")
+  fi
+done < <(vault_dirty)
+
+# Noted, not refused, and never staged or demanded in the summary. Measured
+# 2026-08-15: a routine `board.md` refresh (cb-board runs from every ~30s
+# cb-watch tick) refused the whole commit, and since a pass takes minutes that
+# made the nightly run refuse essentially every time. A check that always fires
+# is worse than no check — it trains its reader to ignore it. The line still
+# prints because a reader comparing the commit against `git status` deserves to
+# know why those files are dirty and absent.
+if [ "${#generated[@]}" -gt 0 ]; then
+  printf 'cb-distill: note — %d fleet-generated file(s) changed during the pass, left alone:\n' "${#generated[@]}"
+  for p in "${generated[@]}"; do printf '  ~ %s (regenerated by its own writer, not by this pass)\n' "$p"; done
+fi
+
+# C5. A write to `People/someone.md` was neither committed (correct), refused,
+# nor reported — it just sat as `?? People/`, and nobody learned the agent had
+# tried. Report and refuse; do not stage it and do not revert it, because naming
+# it is the whole job and destroying the evidence is not this script's call.
+# These are the hand-maintained destinations, so nothing else on the machine
+# writes them and "dirty during the pass" really does mean the pass wrote it.
+if [ "${#outside[@]}" -gt 0 ]; then
+  echo "cb-distill: REFUSED — the pass wrote $(( ${#outside[@]} )) path(s) it may not write:" >&2
+  for p in "${outside[@]}"; do echo "  - $p" >&2; done
+  echo "  Allowed roots: ${ALLOWED_ROOTS[*]} (minus the never-touch list in lib/denylist.sh)." >&2
+  echo "  Nothing was committed and nothing was reverted — those writes are still in the tree for a human." >&2
+  exit 2
+fi
+
+# Completeness, and the form the summary has to take. A SUBSTRING match on the
+# path is not enough and that is not a style point: the refusal below prints the
+# path, the skill told the agent to add it to the summary, and a bare paste then
+# satisfied the check — which is how an unrelated hand edit got committed under
+# `distill: … 1 findings into 1 files`. So the entry must carry the path AND its
+# before and after on the same line, which is DoD #5 ("the change summary shows
+# before/after prose for every in-place rewrite") finally made mechanical.
+# Documented as THE form at the top of the summary template in distill/SKILL.md.
+#
+# Substring rather than whole-line on the path itself, because the summary is
+# required to cite destinations as `file:line`.
+summary_entry_ok() {
+  grep -F -- "$1" "$SUMMARY" \
+    | grep -E '[Bb]efore[*_[:space:]]*:' \
+    | grep -qE '[Aa]fter[*_[:space:]]*:'
+}
+unnamed=()
+for p in ${changed[@]+"${changed[@]}"}; do
+  summary_entry_ok "$p" || unnamed+=("$p")
+done
+if [ "${#unnamed[@]}" -gt 0 ]; then
+  echo "cb-distill: REFUSED — $(( ${#unnamed[@]} )) file(s) changed during this pass without a before/after entry in \`$SUMMARY_REL\`:" >&2
+  for p in "${unnamed[@]}"; do echo "  - $p" >&2; done
+  echo "  Each needs one entry on one line: the path (as \`file:line\`), a \`before:\` and an \`after:\`." >&2
+  echo "  Pasting the path alone is NOT the fix — the before/after prose is what makes an in-place" >&2
+  echo "  rewrite reviewable, and a path with no prose behind it reports nothing. If one of these is" >&2
+  echo "  not yours, it was already dirty when the pass started and something re-dirtied it since;" >&2
+  echo "  leave it alone and say so. Nothing was committed; the tree is untouched." >&2
+  exit 2
+fi
+
+# The narrower sibling of the `git add -A` invariant, and the reason it needs
+# its own check: `git add -- <path>` stages the whole worktree blob, so if
+# ns-capability-drift has already STAGED a hunk in a file the distiller then
+# edited, drift's staged-uncommitted work rides along in the `distill:` commit
+# and "revert one SHA" stops being true for it. Refuse and let a human separate
+# the two — the alternative is a commit that silently claims someone else's work.
+staged_clash=()
+while IFS= read -r -d '' p; do
+  for c in ${changed[@]+"${changed[@]}"}; do
+    [ "$p" = "$c" ] && staged_clash+=("$p")
+  done
+done < <(git -C "$VAULT" diff -z --cached --name-only)
+if [ "${#staged_clash[@]}" -gt 0 ]; then
+  echo "cb-distill: REFUSED — $(( ${#staged_clash[@]} )) file(s) already carry someone else's STAGED work:" >&2
+  for p in "${staged_clash[@]}"; do echo "  - $p" >&2; done
+  echo "  committing them would sweep that work into the distill commit. Nothing was committed." >&2
+  exit 2
+fi
+
+paths=()
+for p in ${changed[@]+"${changed[@]}"}; do paths+=("$p"); done
+paths+=("$SUMMARY_REL")
+
+# N is the number of source reports this run consumed, M the number of vault
+# files it rewrote — a run that declines everything is a legitimate `0 findings
+# into 0 files` whose summary still commits and still retires the queue.
+mapfile -t pend < <(pending | cut -f1)
+mapfile -t pend_path < <(pending | cut -f2)
+nfind="${#pend[@]}"; nfile="${#changed[@]}"
+
+# F6. The completeness check above is one-directional: it catches "a file
+# changed but was not reported" and never "a queued report was never addressed".
+# The retirement loop below marks EVERY pending slug distilled, so a pass that
+# handled 2 of 5 and named only its own changed files passed, committed, and
+# permanently retired the other 3 with nobody having looked at them — reproduced
+# with `d-c`, which left the queue while the summary never mentioned it. This is
+# the symmetric check, and it makes an explicit decline the only way to drop
+# something: a decline is recorded in the summary and routed to /ingest, silence
+# is not. Named = the slug or the landed path it was queued under; a decline
+# cites one or the other, and the skill's step 1 tells the agent to cite both.
+unaddressed=()
+for i in ${pend[@]+"${!pend[@]}"}; do
+  grep -qF -- "${pend[$i]}" "$SUMMARY" && continue
+  grep -qF -- "${pend_path[$i]}" "$SUMMARY" && continue
+  unaddressed+=("${pend[$i]}")
+done
+if [ "${#unaddressed[@]}" -gt 0 ]; then
+  echo "cb-distill: REFUSED — $(( ${#unaddressed[@]} )) queued report(s) are not named in \`$SUMMARY_REL\`:" >&2
+  for p in "${unaddressed[@]}"; do echo "  - $p" >&2; done
+  echo "  Committing retires the whole queue, so an unmentioned report would be written off unread." >&2
+  echo "  Every pending report needs a line — a write, or an explicit decline with its reason." >&2
+  echo "  A decline is a legitimate outcome and /ingest picks it up. Nothing was committed." >&2
+  exit 2
+fi
+subject="distill: $LOCAL — $nfind findings into $nfile files"
+
+if [ -n "$dry" ]; then
+  printf 'cb-distill: WOULD commit "%s"\n' "$subject"
+  for p in "${paths[@]}"; do printf '  %s\n' "$p"; done
+  exit 0
+fi
+
+# One local commit, exact paths to BOTH `add` and `commit`, never a push.
+# Passing them to `git commit` too is the part that matters: `git commit`
+# without a pathspec writes the whole index. flock'd on the same lock cb-land
+# takes — a different lockfile would be no mutex at all — because cb-watch's
+# ~30s landing arm, the routing pass and a live session all touch this index.
+mkdir -p "$LOCKDIR"
+{
+  flock 9
+  # NEVER redirect stderr on `git add`: one unmatched pathspec aborts the whole
+  # add, and a silenced abort commits nothing while reporting success.
+  git -C "$VAULT" add -- "${paths[@]}"
+  git -C "$VAULT" commit -q -m "$subject
+
+Prose from landed X-Man reports integrated into the pages that own it, by the
+distill ops agent (.claude/skills/distill/SKILL.md), refined-not-appended.
+
+The change summary is the deliverable: $SUMMARY_REL carries the
+before and after prose for every in-place rewrite plus anything the pass
+declined as ambiguous. This commit is complete — cb-distill --commit refuses
+when a changed file the summary does not name. Wholesale revert is one SHA.
+
+Local commit, never pushed." -- "${paths[@]}" >/dev/null
+} 9>"$LOCKDIR/vault-git.lock"
+
+# Retire the queue only AFTER the commit lands. Marked here rather than by the
+# agent so a run that fails its completeness check stays pending and gets
+# another pass instead of being silently written off.
+for slug in ${pend[@]+"${pend[@]}"}; do
+  printf '%s\t%s\n' "$(date -Is)" "$SUMMARY_REL" | atomic_write "$(cb_task_dir "$slug")/distilled"
+done
+
+printf 'cb-distill: %d findings into %d files -> %s\n' "$nfind" "$nfile" "$SUMMARY_REL"
+exit 0

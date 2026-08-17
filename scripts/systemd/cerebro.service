@@ -1,0 +1,18 @@
+# cerebro.service — oneshot ensure of the always-on Cerebro coordinator
+# session. Paired with cerebro.timer (the actual keep-alive loop). Install:
+#   cp scripts/cerebro/systemd/cerebro.{service,timer} ~/.config/systemd/user/
+#   systemctl --user daemon-reload && systemctl --user enable --now cerebro.timer
+#   loginctl enable-linger kyle   # survive logout/reboot
+#
+# Deliberately NOT Type=forking + Restart=always: with a pre-existing shared
+# tmux server, `tmux new-session -d` messages that server and exits, leaving
+# systemd no main PID to track -> it would judge the service dead and
+# kill/recreate the session in a loop. Oneshot-ensure + timer is self-healing
+# without PID games: claude crash -> pane dies -> session ends -> next timer
+# tick recreates it.
+[Unit]
+Description=Cerebro coordinator ensure (always-on Claude session)
+
+[Service]
+Type=oneshot
+ExecStart=%h/vault/scripts/cerebro/cb-ensure-session

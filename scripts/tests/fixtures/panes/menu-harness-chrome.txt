@@ -1,0 +1,13 @@
+● Wave 2 (cb-land) is building. Wave 1 is verified green and staged in the working tree.
+✻ Waiting for 1 background agent to finish
+────────────────────────────────────────────────────────────────────
+  Set up auto mode for your environment?
+  Auto mode lets Claude act without asking first. Telling it which repos you trust and what data is sensitive gives it clearer guardrails on what's safe to run.
+  ❯ 1. Set it up
+    2. Not now
+    3. Don't show again
+  Enter to confirm · Esc to cancel
+────────────────────────────────────────────────────────────────────
+❯ 
+  vault  |  cerebro/deterministic-report-landing  |  [░░░░░░░░░░] 17%  |  Opus 5
+  ◯ general-purpose  Confirming pre-existing failures in cb-reactive-intake.bats    16m 21s

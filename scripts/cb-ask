@@ -1,0 +1,120 @@
+#!/usr/bin/env bash
+# scripts/cerebro/cb-ask <slug> "<question>" [--options "a|b|c"]
+#
+# The DECLARED-gate verb (Nick Fury P1). An X-Man that needs a human decision
+# declares it here instead of leaving the coordinator to infer one from a
+# manifest gate or a beacon descriptor: the exact question (plus optional
+# choices) lands in the task's R12 decisions log under the `declared` verb, and
+# the worker's beacon is moved to `paused:` so the watcher leaves it alone.
+#
+# Why `paused:` and not `blocked:` — cb-watch calls cb-remediate every tick while
+# a task classifies `blocked` (cb-watch:79-81), and cb-remediate sends
+# CB_RESUME_LINE ("continue") into the pane once spend is flowing
+# (cb-remediate:72). A worker waiting on an answer must NOT be nudged to
+# continue. `paused` (R6) is the declared-wait state: never remediated, never
+# escalated as a wedge, and it still resurfaces past CB_PAUSE_RESURFACE_SECS so a
+# forgotten ask cannot rot.
+#
+# The watcher's own heuristic `open` stays as the fail-safe net for a silent
+# worker (design spec: BOTH paths), but stands down for any task with a live
+# declared decision — see cb-watch. So one task never surfaces twice.
+set -euo pipefail
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$here/lib/paths.sh"; source "$here/lib/classify.sh"
+
+usage() { echo "usage: cb-ask <slug> \"<question>\" [--options \"a|b|c\"] [--supersedes <key>]" >&2; exit 2; }
+
+slug="${1:-}"; [ -n "$slug" ] || usage; shift
+question="${1-}"; [ $# -gt 0 ] || usage; shift
+options=""; supersedes=""
+while [ $# -gt 0 ]; do case "$1" in
+  --options) [ $# -ge 2 ] || usage; options="$2"; shift 2;;
+  # --supersedes: this question REPLACES an earlier one. Sharpening a question
+  # after reading more used to leave both on the board — the newer one saying
+  # "SUPERSEDES 1493386392" in prose nothing could read (eja-3881, 2026-08-02),
+  # so Kyle was handed the same decision three times in one evening.
+  --supersedes) [ $# -ge 2 ] || usage; supersedes="$2"; shift 2;;
+  *) usage;;
+esac; done
+
+cb_require_slug "$slug" || exit 2
+
+# Flatten to ONE tab-free line: the decisions log is line-oriented and every
+# consumer reads it with IFS=$'\t' read (cb-watch:29, cb-board:40/47,
+# cb-digest:28). Collapse runs of whitespace, then trim.
+flatten() { printf '%s' "$1" | tr '\n\t\r' '   ' | tr -s ' ' | sed -e 's/^ *//' -e 's/ *$//'; }
+question="$(flatten "$question")"
+options="$(flatten "$options")"
+[ -n "$question" ] || usage
+
+# A question that is ONLY a flag-shaped token is a mis-invocation, not an ask —
+# the agent meant to pass a flag and it landed in the question slot. REFUSE here,
+# which is the opposite polarity to _do_supersede below, and deliberately: a bad
+# --supersedes key still leaves a real question worth escalating, whereas this
+# leaves a decision with no question in it. Nothing can answer it, so it becomes
+# permanent noise — cb-watch escalates it to Kyle every batch, forever, and only
+# a hand-written `resolved` line ever clears it.
+# Measured 2026-08-05: `prsync-c` carried an open decision whose entire question
+# text was `--clear`, and it rode along in three consecutive supervisor batches
+# reading "prsync-c: --clear" before anyone looked at why.
+# Deliberately narrow: the WHOLE question must be one bare `--token` with no
+# spaces. A real question that merely mentions a flag still contains prose.
+case "$question" in
+  --*) case "$question" in
+         *' '*) : ;;   # has prose — a real question that happens to start with a flag
+         *) echo "cb-ask: '$question' is a flag, not a question — the question argument came from the wrong slot. Usage: cb-ask <slug> \"<question>\" [--options a|b|c]" >&2; exit 2;;
+       esac;;
+esac
+
+td="$(cb_task_dir "$slug")"
+[ -d "$td" ] || { echo "cb-ask: no task dir for '$slug' ($td) — check the slug in your brief" >&2; exit 1; }
+
+gate="$question${options:+ [$options]}"
+key="$(_decision_key needs-input "$gate")"
+
+# _do_supersede — retire the named predecessor. Runs on BOTH the fresh-declare
+# and the already-open paths: a retry of the same cb-ask must not silently drop
+# the supersession just because the question itself is unchanged.
+#
+# WARN, never refuse. A bad --supersedes key must not cost us the ask — the
+# question is the thing that matters, and a refusal here would leave Kyle with
+# neither decision. Same fail-safe-to-escalate polarity as the verb audit.
+_do_supersede() {
+  [ -n "$supersedes" ] || return 0
+  case "$supersedes" in *[!0-9]*|'') echo "cb-ask: --supersedes '$supersedes' is not a decision key (digits) — ignored" >&2; return 0;; esac
+  if [ "$supersedes" = "$key" ]; then
+    echo "cb-ask: --supersedes names this same decision (key $key) — ignored" >&2; return 0
+  fi
+  if ! _is_open "$td" "$supersedes"; then
+    echo "cb-ask: --supersedes $supersedes is not an open decision on $slug — ignored" >&2; return 0
+  fi
+  _decision_supersede "$td" "$key" "$supersedes"
+  echo "cb-ask: $slug key $key supersedes $supersedes (closed)"
+}
+
+if _is_open "$td" "$key"; then
+  _do_supersede
+  echo "cb-ask: $slug already has this decision open (key $key) — no-op"
+  exit 0
+fi
+
+# state MUST be needs-input: cb-board's _bucket_decision (cb-board:22-27) has no
+# default arm, so any other state would fold open but never render.
+_decision_declare "$td" "$key" needs-input "$gate"
+# after the declare — the fold's authority guard requires the superseding key to
+# already be `declared` in the log, so a heuristic `open` can never retire a
+# human-authored question.
+_do_supersede
+# cb-start writes the launch beacon as a BARE `running` with NO trailing newline
+# (cb-start:228). Appending straight onto it yields `runningpaused: …`, which
+# _beacon_state (classify.sh:25) reads as `runningpaused` — neither paused nor
+# blocked — so classify falls through to the liveness branch, returns `running`,
+# and cb-watch's running-arm resolves the decision we just declared. Terminate
+# the last line first if it is unterminated.
+# (`$(tail -c1 …)` is empty iff the file already ends in a newline. `if`, not an
+# `&&` chain, so `set -e` semantics are unambiguous.)
+if [ -s "$td/status" ] && [ -n "$(tail -c1 "$td/status")" ]; then
+  printf '\n' >> "$td/status"
+fi
+printf 'paused: awaiting answer — %s\n' "$gate" >> "$td/status"
+echo "cb-ask: $slug declared (key $key): $gate"

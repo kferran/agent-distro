@@ -1,0 +1,17 @@
+# cerebro-watchlist.service — oneshot watch-list tick (Job B), fired hourly by
+# cerebro-watchlist.timer. Renders every signal's tracker from the shared manifest
+# (idempotent) and nudges the coordinator to poll each DUE signal (per-signal
+# poll_interval in watchlist.md; the hourly tick only acts on signals whose
+# interval has elapsed). Install:
+#   cp scripts/cerebro/systemd/cerebro-watchlist.{service,timer} ~/.config/systemd/user/
+#   systemctl --user daemon-reload && systemctl --user enable --now cerebro-watchlist.timer
+[Unit]
+Description=Cerebro watch-list tick (render trackers + poll due signals)
+
+[Service]
+# cb-watchlist sources lib/push.sh directly, so CB_PUSH_URL / CB_PUSH_TOKEN have
+# to be in the unit's environment or the push path is dead under systemd — see
+# the longer note in cerebro-watch.service. `-` = missing file is not fatal.
+EnvironmentFile=-%h/.cerebro/env
+Type=oneshot
+ExecStart=%h/vault/scripts/cerebro/cb-watchlist --tick

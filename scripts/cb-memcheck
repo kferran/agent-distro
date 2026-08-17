@@ -1,0 +1,237 @@
+#!/usr/bin/env bash
+# cb-memcheck [--report|--tsv|--flags|--pairs] — health of the auto-memory corpus.
+#
+# Read-only. It flags; a human decides. See lib/memcheck.sh for why each check is
+# shaped the way it is.
+#
+#   --report  human-readable summary (default)
+#   --tsv     one row per entry: the audit table's raw data
+#   --flags   compact one-line-per-flag, bounded — what ns-claim-decay CHECK 4 prints
+#   --pairs   absolute-sharing entry pairs for contradiction review (surfacer)
+#
+# WHY IT SCANS A NARROWED TREE. `.claude/worktrees/**` holds full vault clones and
+# `04 Archive/**` holds finished reports; both name memory slugs in passing.
+# Counting them made `feedback_asd_not_qe_rubric` look 52-files load-bearing when
+# the live surfaces referencing it are far fewer. The exclusion is in the scan,
+# not a post-filter, so a caller cannot forget it.
+#
+# WHY "REFERENCED" AND "ECHOED" ARE SEPARATE COLUMNS. They point opposite ways.
+# A skill CITING an entry means the entry is doing work. A skill CONTAINING the
+# entry's rule text means the rule already lives at the chokepoint and the memory
+# copy may be an echo. Collapsing them into one "is it used" number would call
+# the most-cited entries the most disposable.
+set -euo pipefail
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$here/lib/memcheck.sh"
+
+VAULT="${VAULT_DIR:-$HOME/vault}"
+MEMDIR="${CB_MEM_DIR:-$VAULT/.claude/memory}"
+INDEX="$MEMDIR/MEMORY.md"
+: "${CB_MEM_SHINGLE:=6}"        # 6-gram: long enough that a collision is an echo
+: "${CB_MEM_ECHO_MIN:=3}"       # >=3 shared shingles before calling it an echo
+: "${CB_MEM_FLAG_CAP:=12}"      # bound --flags so a nightly report stays readable
+
+mode=report
+case "${1:---report}" in
+  --report) mode=report;;
+  --tsv)    mode=tsv;;
+  --flags)  mode=flags;;
+  --pairs)  mode=pairs;;
+  *) echo "usage: cb-memcheck {--report|--tsv|--flags|--pairs}" >&2; exit 2;;
+esac
+
+[ -d "$MEMDIR" ] || { echo "cb-memcheck: no memory dir at $MEMDIR" >&2; exit 1; }
+
+tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
+
+# --- the universe of resolvable [[link]] targets -----------------------------
+# Memory filenames, memory `name:` values (what CLAUDE.md says a link resolves
+# against), and every vault note by full path and by basename.
+: > "$tmp/names"
+for f in "$MEMDIR"/*.md; do
+  b="$(basename "$f" .md)"; printf '%s\n' "$b" >> "$tmp/names"
+  n="$(mc_entry_name "$f")"; [ -n "$n" ] && printf '%s\n' "$n" >> "$tmp/names"
+done
+( cd "$VAULT" && find . -name '*.md' -not -path './.claude/worktrees/*' -not -path './.git/*' \
+    | sed 's|^\./||; s|\.md$||' ) >> "$tmp/names" 2>/dev/null || true
+sed 's|.*/||' "$tmp/names" > "$tmp/names.b"; cat "$tmp/names.b" >> "$tmp/names"
+sort -u "$tmp/names" -o "$tmp/names"
+
+# --- the enforced-surface corpus (skills + cerebro scripts + the root contracts)
+# These are the places a rule can live such that it fires without anyone
+# remembering it. Everything else in the vault is prose a session may never read.
+: > "$tmp/surfaces"
+# `|| true` on both: a missing skills tree or a missing root contract is a thin
+# vault, not a failure. Without it `set -e` kills the whole run on `ls`'s exit 2,
+# and the 2>/dev/null hides the reason.
+( cd "$VAULT" && { find .claude/skills scripts -type f \
+      \( -name '*.md' -o -name '*.sh' -o -name '*.js' -o -name 'cb-*' \) \
+      -not -path 'scripts/cerebro/tests/*' 2>/dev/null || true; }
+  cd "$VAULT" && { ls CLAUDE.md personality.md profile.md 2>/dev/null || true; } ) >> "$tmp/surfaces"
+sort -u "$tmp/surfaces" -o "$tmp/surfaces"
+
+# One normalized shingle set for the whole enforced corpus, built once.
+( cd "$VAULT" && while IFS= read -r s; do [ -f "$s" ] && cat "$s"; done < "$tmp/surfaces" ) \
+  | mc_normalize | mc_shingles "$CB_MEM_SHINGLE" | sort -u > "$tmp/surface.shingles"
+
+# --- index lines -------------------------------------------------------------
+: > "$tmp/index"
+while IFS= read -r line; do
+  slug="$(mc_index_slug "$line")"; [ -n "$slug" ] || continue
+  printf '%s\t%s\t%s\n' "${slug%.md}" "$(mc_index_hook_len "$line")" "${#line}" >> "$tmp/index"
+done < "$INDEX"
+
+index_bytes="$(wc -c < "$INDEX" | tr -d ' ')"
+index_lines="$(wc -l < "$tmp/index" | tr -d ' ')"
+
+# --- per-entry pass ----------------------------------------------------------
+: > "$tmp/rows"
+for f in "$MEMDIR"/*.md; do
+  slug="$(basename "$f" .md)"; [ "$slug" = "MEMORY" ] && continue
+
+  # `exit` on the first match: a duplicated index line would otherwise make this
+  # print two values, and the multi-line result corrupts that entry's whole TSV
+  # row. The duplicate itself is flagged separately below.
+  hooklen="$(awk -F'\t' -v s="$slug" '$1==s{print $2; found=1; exit} END{if(!found) print "NOINDEX"}' "$tmp/index")"
+  linelen="$(awk -F'\t' -v s="$slug" '$1==s{print $3; found=1; exit} END{if(!found) print 0}' "$tmp/index")"
+
+  # cited: a live surface names the slug (evidence it is load-bearing)
+  cited=0; citedby=""
+  while IFS= read -r s; do
+    [ -f "$VAULT/$s" ] || continue
+    if grep -qF -- "$slug" "$VAULT/$s"; then
+      cited=$((cited+1)); [ -z "$citedby" ] && citedby="$s"
+    fi
+  done < "$tmp/surfaces"
+
+  # cited_mem: other entries lean on it. Cohesion, not enforcement — an entry
+  # several others link to cannot be dropped without breaking their reasoning.
+  citedmem="$(grep -lF -- "$slug" "$MEMDIR"/*.md 2>/dev/null \
+                | grep -v "/$slug\.md$" | grep -vc '/MEMORY\.md$' || true)"
+  [ -n "$citedmem" ] || citedmem=0
+
+  # echoed: the entry's own rule text appears verbatim in a surface
+  mc_normalize < "$f" | mc_shingles "$CB_MEM_SHINGLE" | sort -u > "$tmp/e.shingles"
+  shared="$(comm -12 "$tmp/e.shingles" "$tmp/surface.shingles" | wc -l | tr -d ' ')"
+  echoat=""
+  if [ "$shared" -ge "$CB_MEM_ECHO_MIN" ]; then
+    comm -12 "$tmp/e.shingles" "$tmp/surface.shingles" | head -20 > "$tmp/hit"
+    # Locate the densest surface, reported as file:line for the audit's evidence
+    # column. Break on the first hit rather than piping to `head`: under pipefail
+    # a closed pipe surfaces as exit 141 and would kill the whole scan.
+    echoat="$( cd "$VAULT" && while IFS= read -r s; do
+        [ -f "$s" ] || continue
+        h="$(grep -n -i -F -f "$tmp/hit" "$s" 2>/dev/null | head -1)" || true
+        if [ -n "$h" ]; then printf '%s:%s\n' "$s" "${h%%:*}"; break; fi
+      done < "$tmp/surfaces" )"
+  fi
+
+  dead="$(mc_dead_links "$f" "$tmp/names" | paste -sd, - )"
+  shape="$(mc_schema_shape "$f")"
+  type="$(mc_entry_type "$f")"; [ -n "$type" ] || type="-"
+  name="$(mc_entry_name "$f")"
+  namematch=ok; [ "$name" = "$slug" ] || namematch="drift:$name"
+
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$slug" "$type" "$hooklen" "$linelen" "$cited" "${citedby:--}" \
+    "$citedmem" "$shared" "${echoat:--}" "${dead:--}" "$shape" "$namematch" >> "$tmp/rows"
+done
+
+case "$mode" in
+tsv)
+  printf 'slug\ttype\thook_chars\tline_chars\tcited_surfaces\tcited_first\tcited_memory\tshared_shingles\techo_at\tdead_links\tschema\tname\n'
+  cat "$tmp/rows"
+  ;;
+
+pairs)
+  # Surfacer, not a detector: entries whose absolutes share a subject noun.
+  for f in "$MEMDIR"/*.md; do
+    slug="$(basename "$f" .md)"; [ "$slug" = "MEMORY" ] && continue
+    mc_absolutes "$f" | grep -q . || continue
+    printf '%s\t%s\n' "$slug" "$(mc_subject_tokens "$f" 5 | paste -sd' ' -)"
+  done > "$tmp/subj"
+  echo "# candidate contradiction pairs — entries that BOTH state absolutes about a shared subject."
+  echo "# A pair here is a prompt to read two entries side by side, nothing more."
+  awk -F'\t' '{a[NR]=$1; b[NR]=$2} END{
+    for (i=1;i<=NR;i++) for (j=i+1;j<=NR;j++) {
+      n=split(b[i],x," "); m=split(b[j],y," "); c=0; sh=""
+      for (p=1;p<=n;p++) for (q=1;q<=m;q++) if (x[p]==y[q]) { c++; sh=sh" "x[p] }
+      if (c>=2) printf "%s  <->  %s   (shared:%s)\n", a[i], a[j], sh
+    }}' "$tmp/subj"
+  ;;
+
+flags)
+  # WHAT NIGHTLY FLAGGING IS FOR: regression, not backlog. Orphan-ness ("no live
+  # surface names it") is deliberately NOT here — 43 of 58 entries trip it today,
+  # because skills are forbidden to cite memory at all, so it would print a
+  # 43-line wall every night and train the reader to skip the section. It stays
+  # in --report, where a human is already looking on purpose. What IS here are
+  # defects that should sit at zero once the index is ratified: an over-budget
+  # hook, an entry missing from the index, an index line pointing at nothing, a
+  # dead link. Each one is then a REGRESSION the night it appears.
+  n=0
+  while IFS= read -r line; do
+    slug="$(mc_index_slug "$line")"; [ -n "$slug" ] || continue
+    if [ ! -f "$MEMDIR/$slug" ]; then
+      printf -- '- %s — index line points at a file that does not exist\n' "${slug%.md}"
+      n=$((n+1))
+    fi
+  done < "$INDEX"
+  # A slug listed twice: the second line is invisible to the per-entry pass, so
+  # its hook is never budgeted and its content never audited.
+  while IFS= read -r dup; do
+    printf -- '- %s — listed more than once in MEMORY.md\n' "$dup"; n=$((n+1))
+  done < <(cut -f1 "$tmp/index" | sort | uniq -d)
+  while IFS=$'\t' read -r slug type hook line cited citedby citedmem shared echoat dead shape name; do
+    if [ "$n" -ge "$CB_MEM_FLAG_CAP" ]; then echo "(+more — run cb-memcheck --report)"; break; fi
+    out=""
+    if [ "$hook" = "NOINDEX" ]; then
+      out="missing from MEMORY.md"
+    elif [ "$hook" = "-1" ]; then
+      # mc_index_hook_len distinguishes "malformed line" (-1) from "empty hook"
+      # (0) on purpose. Folding -1 into the numeric comparison below would test
+      # `-1 -gt 100` and pass, so a line with a link and no hook separator would
+      # be the one defect the budget check silently tolerates.
+      out="index line has no hook separator"
+    elif [ "$hook" -gt "$CB_MEM_HOOK_MAX" ] 2>/dev/null; then
+      out="index hook ${hook}c > ${CB_MEM_HOOK_MAX}"
+    fi
+    [ "$dead" != "-" ] && out="${out:+$out; }dead link(s): $dead"
+    if [ -n "$out" ]; then printf -- '- %s — %s\n' "$slug" "$out"; n=$((n+1)); fi
+  done < "$tmp/rows"
+  # `[ "$n" = 0 ] && echo ...` would leave the script's exit status at 1 on the
+  # normal path where flags WERE found — a caller gating on `if cb-memcheck` then
+  # reads "flags exist" as "the tool failed".
+  if [ "$n" = 0 ]; then echo "Memory corpus: clear"; fi
+  ;;
+
+report)
+  over="$(awk -F'\t' -v m="$CB_MEM_HOOK_MAX" '$3!="NOINDEX" && $3+0>m' "$tmp/rows" | wc -l | tr -d ' ')"
+  orphan="$(awk -F'\t' '$5==0' "$tmp/rows" | wc -l | tr -d ' ')"
+  isolated="$(awk -F'\t' '$5==0 && $7==0' "$tmp/rows" | wc -l | tr -d ' ')"
+  echoes="$(awk -F'\t' -v k="$CB_MEM_ECHO_MIN" '$8+0>=k' "$tmp/rows" | wc -l | tr -d ' ')"
+  deadn="$(awk -F'\t' '$10!="-"' "$tmp/rows" | wc -l | tr -d ' ')"
+  flat="$(awk -F'\t' '$11=="flat"' "$tmp/rows" | wc -l | tr -d ' ')"
+  drift="$(awk -F'\t' '$12!="ok"' "$tmp/rows" | wc -l | tr -d ' ')"
+  total="$(wc -l < "$tmp/rows" | tr -d ' ')"
+
+  echo "memory corpus — $total entries, index $index_bytes bytes / $index_lines lines"
+  echo
+  echo "  index hook over ${CB_MEM_HOOK_MAX}c ......... $over"
+  echo "  no live surface references it .... $orphan"
+  echo "  and no other entry either ........ $isolated"
+  echo "  rule text echoed in a surface .... $echoes  (candidates only — verify the chokepoint fires)"
+  echo "  dead [[links]] ................... $deadn"
+  echo "  legacy flat frontmatter .......... $flat"
+  echo "  name: differs from filename ...... $drift"
+  echo
+  echo "-- worst index hooks --"
+  awk -F'\t' '$3!="NOINDEX"{printf "%6s  %s\n", $3, $1}' "$tmp/rows" | sort -rn | head -10
+  echo
+  echo "-- echo candidates (shared 6-grams, densest surface) --"
+  awk -F'\t' -v k="$CB_MEM_ECHO_MIN" '$8+0>=k{printf "%4s  %-48s %s\n", $8, $1, $9}' "$tmp/rows" | sort -rn | head -20
+  echo
+  echo "-- dead links --"
+  awk -F'\t' '$10!="-"{printf "  %-48s %s\n", $1, $10}' "$tmp/rows"
+  ;;
+esac

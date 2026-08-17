@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+# scripts/cerebro/cb-promote <slug> [--slug <new-slug>] — research → code
+# seed (T36). A research report carrying `promote_to: code` scaffolds a dev
+# item DRAFT (status: drafting) at 00 Inbox/<new-slug>.md,
+# seeded from the report's Answer + Recommended-next-action sections and
+# LINKING the report (never pasting its body). Kyle reviews and queues it —
+# routing stays his; this script never sets `queued` and never overwrites.
+set -euo pipefail
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"; source "$here/lib/paths.sh"
+: "${CB_VAULT:=$HOME/vault}"
+
+slug="${1:-}"; [ -n "$slug" ] || { echo "usage: cb-promote <slug> [--slug <new-slug>]" >&2; exit 2; }
+shift
+newslug="$slug-code"
+while [ $# -gt 0 ]; do case "$1" in
+  --slug) [ $# -ge 2 ] || { echo "cb-promote: --slug requires a value" >&2; exit 2; }; newslug="$2"; shift 2;;
+  *) echo "cb-promote: unknown arg $1" >&2; exit 2;; esac; done
+
+rep="$(cb_task_dir "$slug")/report.md"
+[ -f "$rep" ] || { echo "cb-promote: no report.md for $slug" >&2; exit 1; }
+promote="$(awk '/^---[[:space:]]*$/{n++; next} n==1 && /^promote_to:/{sub(/^promote_to:[[:space:]]*/,""); sub(/[[:space:]]*$/,""); print; exit}' "$rep")"
+[ "$promote" = "code" ] || { echo "cb-promote: $slug report has promote_to: '${promote:-unset}' — nothing to promote" >&2; exit 1; }
+
+item="$CB_VAULT/00 Inbox/$newslug.md"
+[ -e "$item" ] && { echo "cb-promote: $item already exists — refusing to overwrite" >&2; exit 1; }
+mkdir -p "$(dirname "$item")"
+
+# section EXTRACT — the seed is Answer + Recommended next action only; the
+# report body stays linked, not pasted.
+section() { # section <heading-regex>
+  awk -v h="$1" '
+    $0 ~ "^#+ " h "[[:space:]]*$" { on=1; next }
+    on && /^#+ / { exit }
+    on { print }
+  ' "$rep"
+}
+answer="$(section "Answer")"
+nextact="$(section "Recommended next action")"
+
+{
+  printf -- '---\nslug: %s\ncreated: %s\nstatus: drafting\ndomain: \nrepo: \nrelated:\n  - "~/.cerebro/tasks/%s/report.md"\n---\n\n' \
+    "$newslug" "$(date +%F)" "$slug"
+  printf '# %s\n\n## Goal\n%s\n' "$newslug" "${answer:-<!-- fill from the report -->}"
+  if [ -n "$nextact" ]; then printf '\n## Recommended next action (from the research report)\n%s\n' "$nextact"; fi
+  printf '\n## Context\n\nSeeded by cb-promote from Cerebro research task `%s` — full report (evidence, confidence, from_commit) at `~/.cerebro/tasks/%s/report.md`. Kyle reviews, fills domain/repo, and queues.\n' \
+    "$slug" "$slug"
+} | atomic_write "$item"
+echo "cb-promote: drafted $item — review, fill domain/repo, and set status: queued to dispatch"

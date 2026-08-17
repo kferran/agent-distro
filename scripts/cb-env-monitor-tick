@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+# cb-env-monitor-tick — dispatch ONE env-error-monitor pass, guarded.
+#
+# WHY THIS SCRIPT EXISTS. The env log monitor ran as a session-only Claude cron
+# (dda7cb45) from 2026-07-28. Session-only crons die silently when the session
+# ends: on 2026-08-05 the monitor was dead from the prior session's exit until
+# 14:2x MT, straight through the window EDJ was waiting on the empty-200 watch,
+# and nothing raised an alarm. During the EDJ go-live push — offshore testing
+# overnight, an 8/17 PreProd cutoff — "coverage depends on a chat session staying
+# alive" is not a monitoring story. Kyle 2026-08-05: install a systemd timer and
+# retire the cron.
+#
+# The dispatcher logic is the same as the cron's, which is why it is only a guard
+# plus a spawn: the RUNBOOK is the spec and it lives in the vault
+# (02 Areas/Engineering-Work/env-error-monitor-runbook.md). Refine the runbook,
+# never this file.
+set -euo pipefail
+
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SLUG="env-error-monitor-tick"
+LOG="${CB_HOME:-$HOME/.cerebro}/logs/env-monitor-dispatch"
+mkdir -p "$(dirname "$LOG")"
+
+note() { printf '%s %s\n' "$(date -Is)" "$1" >> "$LOG"; }
+
+# Guard: a prior pass still running means it is wedged, not that we are early.
+# Spawning a second would double-query Kusto and race on the trend-line write.
+if tmux list-windows -t cb 2>/dev/null | grep -q "$SLUG"; then
+  note "SKIP — prior pass still live (wedged); not spawning a second"
+  exit 0
+fi
+
+if "$here/cb-start" --ops "$SLUG" >>"$LOG" 2>&1; then
+  note "spawned"
+else
+  # A failed spawn must be LOUD in the log. A monitor that silently fails to
+  # start is indistinguishable from a monitor reporting all-clear — the exact
+  # failure this whole change exists to remove.
+  note "FAILED to spawn — env monitoring did NOT run this hour"
+  exit 1
+fi

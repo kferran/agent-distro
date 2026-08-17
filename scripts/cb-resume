@@ -1,0 +1,268 @@
+#!/usr/bin/env bash
+# scripts/cerebro/cb-resume <slug> [--target <project>] [--jira <KEY>] [--worktree <path>]
+#
+# The COMPLETE resume for a reaped code task — adopt, brief, send, and then
+# prove an agent actually started.
+#
+# WHY THIS EXISTS (2026-08-02). A code dispatch is three commands: cb-start
+# spawns the harness and WRITES $td/launch-line, cb-brief fills context.md,
+# cb-send delivers the launch line. Run only the first and you get a live tmux
+# session on the right branch, a `running` beacon, a green board entry — and an
+# agent sitting at an empty composer forever. Nothing distinguishes it from a
+# working dispatch until someone reads the pane.
+#
+# `cb-start --code --adopt <slug>` alone was nevertheless the documented resume
+# in ~20 places, including the string cb-reap and cb-stuck PRINT AT RUNTIME to
+# whoever reaps a task. On 2026-08-02 three old tasks had their needs-input
+# decisions resolved at 16:56-16:57 UTC, something ran that documented command,
+# and no brief was ever delivered to any of them. All three worktrees held a
+# byte-identical ~206-byte context.md — cb-start's adopted-session marker
+# (cb-start:213), written only when no context.md exists. That marker is the
+# fingerprint of a half-run dispatch.
+#
+# So this command cannot be half-run. It is also the thing automation should
+# call: magneto-build-ready.md:253 proposes a cb-remediate class that resumes
+# `failed` tasks unattended, and pointed at cb-start that would industrialise
+# the half-dispatch against exactly the tasks already in trouble.
+#
+# Bare `cb-start --code --adopt` is deliberately LEFT ALONE — cb-send's
+# auto-re-adopt shells out to it from inside cb-watch and depends on it staying
+# fire-and-forget. Whether it should eventually refuse without a follow-up is
+# Kyle's call, not this script's.
+#
+# Exit codes — distinct on purpose, because an unattended caller has to branch
+# on WHICH half failed:
+#   0  resumed; an agent is observably working
+#   2  usage error
+#   3  refused, NOTHING spawned (already live / no meta / missing worktree /
+#      nothing to brief with)
+#   4  adopt failed — no harness
+#   5  brief or splice failed — harness up, context.md not written
+#   6  cb-send refused (3) or did not deliver (4)
+#   7  HARNESS UP, BRIEF NOT DELIVERED — the send reported nothing wrong and no
+#      agent ever started. The state that currently reads as healthy.
+set -euo pipefail
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$here/lib/paths.sh"; source "$here/lib/classify.sh"; source "$here/lib/coordinator.sh"
+source "$here/lib/conductor.sh"; source "$here/lib/xman.sh"
+
+slug=""; target=""; jira=""; worktree=""
+while [ $# -gt 0 ]; do case "$1" in
+  --target) [ $# -ge 2 ] || { echo "cb-resume: --target requires a project" >&2; exit 2; }; target="$2"; shift 2;;
+  --jira) [ $# -ge 2 ] || { echo "cb-resume: --jira requires a key" >&2; exit 2; }; jira="$2"; shift 2;;
+  --worktree) [ $# -ge 2 ] || { echo "cb-resume: --worktree requires a path" >&2; exit 2; }; worktree="$2"; shift 2;;
+  -h|--help) sed -n '2,3p' "$0"; exit 0;;
+  *) if [ -z "$slug" ] && [ "${1#-}" = "$1" ]; then slug="$1"; shift;
+     else echo "cb-resume: unknown arg $1" >&2; exit 2; fi;; esac; done
+[ -n "$slug" ] || { echo "cb-resume: usage: cb-resume <slug> [--target <project>] [--jira <KEY>] [--worktree <path>]" >&2; exit 2; }
+cb_require_slug "$slug" || exit 2
+
+# R1 (firstmate fm-guard): who-watches-the-watcher rides every command the
+# coordinator runs — warns only, never blocks.
+"${CB_GUARD_CMD:-$here/cb-guard}" >/dev/null 2>&1 || true
+
+: "${CB_RESUME_VERIFY_SECS:=120}"   # how long to wait for a first sign of work
+: "${CB_RESUME_POLL_SECS:=3}"
+
+td="$(cb_task_dir "$slug")"
+
+# --- what we are resuming ONTO -----------------------------------------------
+# Same narrow meta checks cb-send's auto-re-adopt makes (cb-send:222-232): adopt
+# needs a target and an existing worktree, so a task missing either has nothing
+# to resume onto and must refuse rather than spawn something half-formed.
+[ -n "$target" ]   || target="$(_meta_field "$td" target)"
+[ -n "$jira" ]     || jira="$(_meta_field "$td" jira)"
+[ -n "$worktree" ] || worktree="$(_meta_field "$td" worktree)"
+if [ -z "$target" ]; then
+  echo "cb-resume: refusing — no target for '$slug' (none in $td/meta and none passed). NOTHING was spawned; re-run with --target <project>." >&2
+  exit 3
+fi
+if [ -z "$worktree" ] || [ ! -d "$worktree" ]; then
+  echo "cb-resume: refusing — worktree '${worktree:-<unset>}' for '$slug' does not exist. NOTHING was spawned; resume attaches to an EXISTING worktree." >&2
+  exit 3
+fi
+# A live agent is not resumed. Mirrors cb-start --adopt's guard exactly (only a
+# positive `gone` proceeds): typing a fresh launch line at a working conductor
+# concatenates a second task onto its turn. `unavailable` (cannot tell) keeps
+# the conservative answer, same asymmetry rule the rest of the fleet uses.
+_alive="$(cb_session_alive "$slug")"
+if [ "$_alive" != "gone" ]; then
+  echo "cb-resume: refusing — session $slug is $_alive, not gone. NOTHING was sent (a resume into a working agent corrupts its turn)." >&2
+  exit 3
+fi
+
+# --- decide whether to re-brief, BEFORE anything mutates ----------------------
+# Order matters: cb-start --adopt WRITES the marker context.md itself
+# (cb-start:213), so every mtime and content test below has to be taken now.
+# Read it after the adopt and the marker is always newer than brief.md — the
+# staleness test could then never fire, and a resume would happily send a launch
+# line at a context.md that says nothing but "adopted session".
+rundir="$worktree/${CB_SPECS_ROOT:-.ai/specs}/$slug"
+ctx="$rundir/context.md"
+brief="$td/brief.md"
+
+# _is_adopt_marker FILE — is this cb-start's adopted-session marker rather than a
+# real brief? Keyed on the marker's own text, not its ~206-byte length: the byte
+# count varies with the slug and the jira key, so a size test is a coin flip on
+# long slugs. The string is written in exactly one place (cb-start:213).
+_is_adopt_marker() { grep -qF 'Adopted-session marker (cb-start --adopt)' "$1" 2>/dev/null; }
+
+need_brief=""
+if [ ! -f "$ctx" ]; then
+  need_brief="context.md is missing"
+elif _is_adopt_marker "$ctx"; then
+  need_brief="context.md is cb-start's adopted-session marker (no brief in it)"
+elif [ -f "$brief" ] && [ "$brief" -nt "$ctx" ]; then
+  need_brief="brief.md is newer than context.md"
+fi
+
+# NOTHING TO BRIEF WITH is a refusal, not a warning. This is the defect wearing
+# its other mask: briefing from an empty template and sending anyway produces an
+# agent that has been told to read a context.md containing three blank headings.
+# cb-brief writes `# Objective` / `# Context` / `# Scope` empty by design — the
+# dispatch skill fills them — so a resume with no brief.md to splice in has no
+# content to deliver and must say so loudly instead of printing a success banner.
+if [ -n "$need_brief" ] && [ ! -f "$brief" ]; then
+  cat >&2 <<EOF
+cb-resume: refusing — $need_brief, and there is no brief to rebuild it from ($brief).
+NOTHING was spawned. A resume that briefs from cb-brief's empty template and sends
+anyway is the same failure this command exists to prevent: the agent starts, reads
+three blank headings, and has no work.
+Write $brief (or restore $ctx) and re-run.
+EOF
+  exit 3
+fi
+
+# --- 1. adopt ----------------------------------------------------------------
+# `set -e` would abort the whole resume on a nonzero here and report nothing, so
+# every child call in this script captures its status instead (cb-remediate
+# learned the same lesson against cb-send's legitimate exit 3).
+rc=0
+eval "${CB_START_CMD:-$here/cb-start}" --code --adopt "$slug" --target "$target" \
+  ${jira:+--jira "$jira"} --worktree "$worktree" </dev/null || rc=$?
+if [ "$rc" -ne 0 ]; then
+  echo "cb-resume: adopt failed for $slug (cb-start exit $rc) — no harness, nothing briefed or sent." >&2
+  exit 4
+fi
+
+# --- 2. brief + splice -------------------------------------------------------
+# Runs while the harness boots rather than after it: these are file writes the
+# agent has not read yet, and cb-send's own composer wait (CB_COMPOSER_WAIT_SECS)
+# is the harness-up gate that actually matters. Waiting first would just add its
+# latency to every resume.
+if [ -n "$need_brief" ]; then
+  echo "cb-resume: re-briefing $slug — $need_brief"
+  rc=0
+  eval "${CB_BRIEF_CMD:-$here/cb-brief}" --code "$slug" --target "$target" \
+    ${jira:+--jira "$jira"} --worktree "$worktree" >/dev/null </dev/null || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    echo "cb-resume: cb-brief failed for $slug (exit $rc) — harness is up but context.md was not written. NOTHING sent." >&2
+    exit 5
+  fi
+  # SPLICE. cb-brief writes a TEMPLATE: frontmatter, then empty `# Objective` /
+  # `# Context` / `# Scope` headings, then the `# Agent contract` block. The
+  # dispatch skill normally fills that middle by hand. A resume has the content
+  # already — brief.md — so it goes where the skill would have put it: between
+  # the frontmatter and the contract. Skip this and you get a briefed-but-
+  # contentless agent, which reads exactly as healthy from outside.
+  head="$(awk 'NR==1 && $0=="---"{print; fm=1; next} fm && $0=="---"{print; exit} fm{print}' "$ctx")"
+  tail_="$(awk '/^# Agent contract/{f=1} f' "$ctx")"
+  if [ -z "$head" ] || [ -z "$tail_" ]; then
+    echo "cb-resume: cb-brief's context.md has no frontmatter and/or no '# Agent contract' block ($ctx) — refusing to splice into a shape I do not recognise. NOTHING sent." >&2
+    exit 5
+  fi
+  # brief.md's BODY only — its frontmatter is Cerebro bookkeeping (task, type,
+  # clearance, jira) and duplicating it under context.md's own frontmatter would
+  # put a stray `---` block in the middle of the file the agent reads.
+  body="$(awk 'NR==1 && $0=="---"{fm=1; next} fm && $0=="---"{fm=0; next} !fm{print}' "$brief")"
+  if [ -z "$(printf '%s' "$body" | tr -d '[:space:]')" ]; then
+    echo "cb-resume: $brief has no body below its frontmatter — nothing to splice. NOTHING sent." >&2
+    exit 5
+  fi
+  printf '%s\n\n%s\n\n%s\n' "$head" "$body" "$tail_" | atomic_write "$ctx"
+  echo "cb-resume: spliced $(printf '%s' "$body" | wc -l) lines of brief into $ctx"
+else
+  echo "cb-resume: keeping the existing $ctx (not clobbering a good brief)"
+fi
+
+# --- 3. send -----------------------------------------------------------------
+line="$(cat "$td/launch-line" 2>/dev/null || true)"
+if [ -z "$line" ]; then
+  echo "cb-resume: no launch line at $td/launch-line after adopt — nothing to send." >&2
+  exit 5
+fi
+rc=0
+eval "${CB_SEND_CMD:-$here/cb-send}" "$slug" "$line" </dev/null || rc=$?
+# cb-send's exit code is informative in ONE direction. 3 (refused, nothing sent)
+# and 4 (still in the composer after the retry ladder) are positive evidence of
+# NON-delivery — take them at once rather than burning the verify window on a
+# message we already know never landed. 0 is not evidence of anything: on the
+# unverifiable-pane path cb-send exits 0 having only warned on stderr, and on
+# 2026-08-02 it returned 0 and printed nothing on a send that worked. So 0 falls
+# through to the observed-state check below.
+case "$rc" in
+  0) ;;
+  3|4) echo "cb-resume: cb-send did not deliver the launch line to $slug (exit $rc). Harness is up and briefed; the send is what failed." >&2; exit 6;;
+  *) echo "cb-resume: cb-send failed unexpectedly for $slug (exit $rc)." >&2; exit 6;;
+esac
+
+# --- 4. prove an agent started -----------------------------------------------
+# THE POINT OF THE COMMAND. Completion is observed state, never an exit status.
+# Two independent positives, either is enough:
+#   - the pane is BUSY: a spinner/gerund or a ticking work timer. That regex is
+#     a property of the Claude Code build, not of coordinator panes, and it was
+#     measured against cold `--code` conductor boots on 2026-08-02 (2 BUSY
+#     matches on each of two live sessions), so it carries over here.
+#   - the conductor wrote its manifest: the first thing a work-conductor does
+#     with a spec is start producing run artifacts.
+# Deliberately NOT the old READY regex (coordinator.sh's retired
+# CB_COORD_READY_RE): it is empty by design since the 2026-08-02 re-seed, and an
+# empty pattern matches every line — keying completion on it would make the
+# success banner unconditional, which is the entire defect.
+# The manifest test is `_run_in_scope $rundir $ctx` and NOT resolve_run: the
+# manifest we are waiting for does not exist yet when the loop starts, so a
+# one-shot resolve would answer "no run" and that signal could never fire.
+# _run_in_scope carries the freshness floor that matters here anyway — an adopted
+# worktree is full of prior-cycle manifests, and only one written AFTER the
+# context.md we just spliced is evidence that THIS agent read THIS brief.
+deadline=$(( $(date +%s) + CB_RESUME_VERIFY_SECS ))
+started=""; saw_line=""
+while :; do
+  # ONE capture per poll, both questions asked of the same bytes — the reason
+  # cb_coord_composer takes the pane text as an argument at all.
+  pane="$(cb_pane_tail "$slug")"
+  if [ -n "$pane" ]; then
+    if printf '%s\n' "$pane" | grep -qE "$CB_COORD_BUSY_RE"; then started=busy; break; fi
+    if composer="$(cb_coord_composer "$pane")"; then
+      case "$composer" in *"Invoke the ultron"*) saw_line=1;; esac
+      # An emptied composer counts only once the launch line was demonstrably
+      # sitting in it: it catches the same event a beat before the spinner
+      # paints. On its own an empty composer means nothing — that is precisely
+      # what a never-briefed agent shows.
+      if [ -z "$composer" ] && [ -n "$saw_line" ]; then started=submitted; break; fi
+    fi
+  fi
+  if _run_in_scope "$rundir" "$ctx"; then started=manifest; break; fi
+  [ "$(date +%s)" -lt "$deadline" ] || break
+  sleep "$CB_RESUME_POLL_SECS"
+done
+
+if [ -z "$started" ]; then
+  cat >&2 <<EOF
+cb-resume: HARNESS UP, BRIEF NOT DELIVERED — $slug was adopted and briefed and
+cb-send reported no failure, but nothing in session $slug started working within
+${CB_RESUME_VERIFY_SECS}s: the pane never went busy and no conductor manifest appeared.
+This is the state that reads as healthy from the board — a live session, a
+'running' beacon, and an agent that has never been told anything. Attach and look:
+  tmux attach -t $slug
+EOF
+  exit 7
+fi
+
+# The PERSISTED name (xman_read, never a fresh pick) — a resume names the same
+# X-Man the spawn did. cb-start's adopt above already reused and printed it; this
+# repeats it on the line that says the resume worked, which is the one an
+# unattended caller logs. Empty for a task that predates persistence: no name is
+# better than an invented one contradicting what its spawn announced.
+_xman="$(xman_read "$slug" 2>/dev/null || true)"
+echo "cb-resume: resumed $slug — agent working (observed: $started; session=$slug, worktree=$worktree${_xman:+; xman=$_xman})"

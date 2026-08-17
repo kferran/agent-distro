@@ -1,0 +1,184 @@
+#!/usr/bin/env bash
+# scripts/cerebro/cb-watchlist — Job B (watch-list source). Reads the shared
+# manifest (lib/manifest.sh), renders "where things stand" into each signal's
+# target tracker, auto-appends the factual deltas to that tracker's Log (dated
+# one-liners), and fires the §8 out-of-band push on MATERIAL deltas. It is the
+# ONE sanctioned watch-list vault write: additive + mechanical. It SURFACES,
+# never acts on, judgment ("does 7/20 slip?", risk calls, draft replies) — those
+# are for Kyle, never written here.
+#
+# Subcommands:
+#   append SRC KEY STATE DETAIL   append a manifest delta (poll-agent facing)
+#   --render                      render every signal's tracker (idempotent)
+#   --poll                        nudge the coordinator to poll each DUE signal
+#   --tick                        --render then --poll (the hourly entry point)
+#   due SIGNAL                    exit 0 iff the signal is due to poll
+#   mark-polled SIGNAL            reset a signal's poll clock (agent, post-poll)
+#   state-get SIGNAL              print the signal's last-seen state
+#   state-set SIGNAL              write the signal's last-seen state (stdin)
+set -euo pipefail
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$here/lib/paths.sh"
+source "$here/lib/manifest.sh"
+source "$here/lib/watchlist.sh"
+source "$here/lib/push.sh"
+: "${CB_VAULT:=$HOME/vault}"
+: "${CB_SESSION:=Cerebro}"
+: "${CB_WATCH_FLAP_N:=3}"
+
+# _replace_section FILE HEADER BODYFILE — overwrite the content between a level-2
+# HEADER and the next level-2 heading (or EOF) with BODYFILE. Idempotent: the
+# "Where things stand" render can run every tick without accreting. Appends the
+# section at EOF if HEADER is absent.
+_replace_section() {
+  local file="$1" header="$2" bf="$3" tmp
+  tmp="$(mktemp)"
+  awk -v hdr="$header" -v bf="$bf" '
+    BEGIN { while ((getline l < bf) > 0) body = body l "\n" }
+    {
+      if ($0 == hdr) { print; printf "%s", body; found=1; skip=1; next }
+      if (skip) { if (/^## /) { skip=0 } else { next } }
+      print
+    }
+    END { if (!found) { print hdr; printf "%s", body } }
+  ' "$file" > "$tmp"
+  mv -f "$tmp" "$file"
+}
+
+# _append_log FILE DATE BULLETFILE — append BULLETFILE bullets under a `### DATE`
+# subheading of `## Log` (created if absent; new day → new subheading right under
+# `## Log`, most-recent-day first). Additive only — never rewrites prior entries.
+_append_log() {
+  local file="$1" date="$2" bf="$3" tmp
+  grep -q '^## Log' "$file" || printf '\n## Log\n' >> "$file"
+  tmp="$(mktemp)"
+  if grep -qx "### $date" "$file"; then
+    awk -v d="### $date" -v bf="$bf" '
+      BEGIN { while ((getline l < bf) > 0) b = b l "\n" }
+      { print; if ($0 == d) printf "%s", b }
+    ' "$file" > "$tmp"
+  else
+    awk -v d="### $date" -v bf="$bf" '
+      BEGIN { while ((getline l < bf) > 0) b = b l "\n" }
+      { print; if ($0 ~ /^## Log[[:space:]]*$/ && !done) { print ""; print d; printf "%s", b; done=1 } }
+    ' "$file" > "$tmp"
+  fi
+  mv -f "$tmp" "$file"
+}
+
+# _ensure_tracker FILE SIGNAL SECTION — scaffold a durable tracker if it doesn't
+# exist (a curated tracker like preprod-readiness.md is authored by hand; this
+# covers the auto-created case, e.g. a fresh signal's tracker).
+_ensure_tracker() {
+  local f="$1" sig="$2" section="$3"
+  [ -f "$f" ] && return 0
+  mkdir -p "$(dirname "$f")"
+  printf -- '---\ntype: watch-tracker\nsignal: %s\n---\n\n# %s — watch tracker\n\n## %s\n\n## Log\n' \
+    "$sig" "$sig" "$section" > "$f"
+}
+
+# _render_signal SIGNAL — the render + auto-append + material-push for one signal.
+_render_signal() {
+  local sig="$1" relpath tracker now date applied section
+  relpath="$(watchlist_field "$sig" target_tracker)"; [ -n "$relpath" ] || return 0
+  tracker="$CB_VAULT/$relpath"
+  section="$(watchlist_field "$sig" board_section)"; [ -n "$section" ] || section="Where things stand"
+  _ensure_tracker "$tracker" "$sig" "$section"
+
+  # 1. the board_section (e.g. "Where things stand") — overwrite with the deduped
+  #    latest-per-key view.
+  local sectf; sectf="$(mktemp)"
+  {
+    printf '\n'
+    if manifest_latest_per_key "$sig" | grep -q .; then
+      while IFS=$'\t' read -r src key state ts detail flaps; do
+        local dt="${ts%%T*}" flaptag=""
+        [ "${flaps:-1}" -ge "$CB_WATCH_FLAP_N" ] && flaptag=" ⚠ flapping (${flaps}×)"
+        printf -- '- **%s** — %s (%s)%s%s\n' "$key" "$state" "$dt" "${detail:+ — $detail}" "$flaptag"
+      done < <(manifest_latest_per_key "$sig")
+    else
+      printf '_No signals yet._\n'
+    fi
+    printf '\n'
+  } > "$sectf"
+  _replace_section "$tracker" "## $section" "$sectf"
+  rm -f "$sectf"
+
+  # 2. Log auto-append (new events only — per-tracker high-water) + 3. push.
+  # ⚠️ LOCAL date, not the system date. The server runs UTC, which rolls to tomorrow
+  # during Kyle's evening — so from ~18:00 MT a `date +%F` heading files the day's
+  # events under TOMORROW while the event lines themselves carry the MT date. That
+  # happened 2026-08-04 18:5x MT: a `### 2026-08-05` heading over 2026-08-04 entries.
+  # Same trap the eod cron documents; the local-date resolution is load-bearing.
+  now="${CB_NOW:-$(date +%s)}"; date="$(TZ=America/Denver date -d "@$now" +%F 2>/dev/null || TZ=America/Denver date +%F)"
+  applied="$CB_WATCH_STATE/$sig.applied"; mkdir -p "$CB_WATCH_STATE"; touch "$applied"
+  local -A newstate newdetail newts; local order=() key state ts detail h
+  while IFS=$'\t' read -r key state ts detail; do
+    [ -n "$key" ] || continue
+    # high-water is the event's CONTENT hash, not key|ts: two transitions of the
+    # same key can share a second (ts is second-granular), so key|ts would drop
+    # the second one; and a truly-identical re-emitted event SHOULD dedupe.
+    h="$(printf '%s|%s|%s|%s' "$key" "$state" "$ts" "$detail" | cksum | cut -d' ' -f1)"
+    grep -qxF "$h" "$applied" && continue           # already landed in this tracker
+    printf '%s\n' "$h" >> "$applied"
+    [ -n "${newstate[$key]:-}" ] || order+=("$key")  # first sighting this render
+    newstate[$key]="$state"; newdetail[$key]="$detail"; newts[$key]="$ts"   # latest wins (flap→one line)
+  done < <(manifest_events "$sig" | jq -r '[.key,.state,.ts,.detail]|@tsv' 2>/dev/null)
+
+  if [ "${#order[@]}" -gt 0 ]; then
+    local bf; bf="$(mktemp)"
+    for key in "${order[@]}"; do
+      printf -- '- %s **%s** — %s%s\n' \
+        "${newts[$key]%%T*}" "$key" "${newstate[$key]}" "${newdetail[$key]:+ — ${newdetail[$key]}}" >> "$bf"
+      # material delta → the §8 out-of-band push (once per key per render).
+      if watchlist_material_match "$sig" "${newstate[$key]}"; then
+        mkdir -p "$CB_HOME/logs"
+        # cb_push: 0 sent, 1 no channel, 2 a channel is set but unusable (bad
+        # CB_PUSH_FORMAT / slack without jq). Logging "set CB_PUSH_URL" at 2
+        # points Kyle at the one thing that is already correct.
+        _pushrc=0
+        cb_push "watch:$sig $key → ${newstate[$key]}${newdetail[$key]:+ (${newdetail[$key]})}" || _pushrc=$?
+        case "$_pushrc" in
+          0) _pushnote="pushed" ;;
+          2) _pushnote="push channel MISCONFIGURED — check CB_PUSH_FORMAT" ;;
+          *) _pushnote="no push channel — set CB_PUSH_URL" ;;
+        esac
+        printf '%s watch-material %s %s %s (%s)\n' "$(date -Is)" "$sig" "$key" "${newstate[$key]}" "$_pushnote" >> "$CB_HOME/logs/events"
+      fi
+    done
+    _append_log "$tracker" "$date" "$bf"
+    rm -f "$bf"
+  fi
+}
+
+render_all() { local sig; for sig in $(watchlist_signals); do _render_signal "$sig"; done; }
+
+# poll_due — nudge the coordinator to run the watch-poll skill for each DUE
+# signal (fire-and-forget, mirrors cb-intake's dispatch-request). `focus`
+# suspends. Marks polled on a delivered nudge so a still-working poll isn't
+# re-nudged every tick; a failed poll re-nudges next interval.
+poll_due() {
+  [ "$(cat "$CB_HOME/mode" 2>/dev/null)" = "focus" ] && return 0
+  local tmux="${CB_TMUX_BIN:-tmux}" sig
+  for sig in $(watchlist_signals); do
+    watchlist_due "$sig" || continue
+    "$tmux" send-keys -t "$CB_SESSION" "watch-poll $sig"
+    sleep "${CB_SEND_DELAY:-0.3}"
+    "$tmux" send-keys -t "$CB_SESSION" Enter
+    watchlist_mark_polled "$sig"
+    mkdir -p "$CB_HOME/logs"
+    printf '%s watch-poll %s (nudged)\n' "$(date -Is)" "$sig" >> "$CB_HOME/logs/events"
+  done
+}
+
+case "${1:---tick}" in
+  append)        shift; manifest_append "$@";;
+  --render)      render_all;;
+  --poll)        poll_due;;
+  --tick)        render_all; poll_due;;
+  due)           watchlist_due "$2";;
+  mark-polled)   watchlist_mark_polled "$2";;
+  state-get)     watchlist_state_get "$2";;
+  state-set)     watchlist_state_set "$2";;
+  *) echo "usage: cb-watchlist {append|--render|--poll|--tick|due|mark-polled|state-get|state-set}" >&2; exit 2;;
+esac

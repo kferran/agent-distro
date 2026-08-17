@@ -1,0 +1,123 @@
+#!/usr/bin/env bash
+# cb-escalations — the escalation inbox that does not depend on a live pane.
+#
+# WHY THIS EXISTS (2026-08-13). cb_escalate's only delivery paths were
+# cb_coord_send (tmux send-keys into the coordinator pane) and cb_push (an
+# external service via CB_PUSH_URL). Both failed at once and a real question
+# vanished:
+#
+#   cb_coord_send returns 1 unless cb_coord_pane_state reads "empty" — and
+#   coordinator.sh:237-248 documents that the busy and idle frames of this TUI
+#   are STRUCTURALLY IDENTICAL, so the detector cannot reliably say "idle."
+#   During a go-live push the coordinator is working almost continuously, so
+#   almost every escalation defers.
+#
+#   cb_push needs CB_PUSH_URL, which has never been set on this box.
+#
+# The measured cost, 2026-08-13: cr7-cancellation-residuals finished its fix
+# (build clean, 1665 backend + 9736 frontend tests green), failed the push on an
+# unrelated NU1903 advisory, raised needs-input asking what to do — and the
+# question was never delivered. 70 minutes later the conductor promoted itself
+# from needs-input to ready-for-review ON THE SAME UNANSWERED GATE and exited.
+# Four other conductor forks were queued behind it undelivered, one of them for
+# days. Kyle: "You're in charge of this team so when failures like this happen,
+# you need to fix them."
+#
+# THE FIX: escalations are written to a file, always, before any delivery is
+# attempted. A file needs no pane, no tmux, no network, no credential and no
+# service. Delivery becomes best-effort decoration on top of durable state
+# instead of being the only state. Nothing can go missing again; the worst case
+# is that it is read late.
+#
+# CONTRACT — deliberately the same shape as cb-unlanded --blocking, which the
+# fleet tick already treats as a lead-the-report notification:
+#   cb-escalations --pending   list undelivered escalations, newest last; exit 0
+#                              with "nothing pending" when empty
+#   cb-escalations --record SLUG CODE MSG   append one (called by cb_escalate)
+#   cb-escalations --drain     mark every pending item delivered (call AFTER you
+#                              have actually put them in front of Kyle)
+#   cb-escalations --drain KEY mark one item delivered
+#
+# Delivered items move to delivered/ rather than being deleted, so the record of
+# what was asked and when it finally reached him survives.
+
+set -euo pipefail
+
+CB_HOME="${CB_HOME:-$HOME/.cerebro}"
+ESC_DIR="$CB_HOME/escalations"
+PENDING="$ESC_DIR/pending"
+DELIVERED="$ESC_DIR/delivered"
+
+mkdir -p "$PENDING" "$DELIVERED"
+
+usage() {
+  cat >&2 <<'USAGE'
+usage: cb-escalations --pending
+       cb-escalations --record <slug> <code> <message>
+       cb-escalations --drain [key]
+USAGE
+  exit 2
+}
+
+cmd_pending() {
+  local n=0 f
+  shopt -s nullglob
+  for f in "$PENDING"/*.msg; do n=$((n + 1)); done
+  if [ "$n" -eq 0 ]; then
+    echo "cb-escalations: nothing pending"
+    return 0
+  fi
+  echo "cb-escalations: $n PENDING — these are questions nobody has answered yet"
+  echo
+  for f in "$PENDING"/*.msg; do
+    printf -- '--- %s\n' "$(basename "$f" .msg)"
+    cat "$f"
+    echo
+  done
+}
+
+cmd_record() {
+  [ "$#" -ge 3 ] || usage
+  local slug="$1" code="$2"; shift 2
+  local msg="$*"
+  # Stable key per slug+code so a conductor re-raising the same gate updates one
+  # file rather than filling the dir. The age still comes from the first write.
+  local key="${slug}__${code}"
+  key="$(printf '%s' "$key" | tr -c 'A-Za-z0-9_.-' '-')"
+  local f="$PENDING/$key.msg"
+  if [ -f "$f" ]; then
+    # already pending — refresh the message, keep first-seen
+    local first
+    first="$(sed -n 's/^first_seen: //p' "$f" | head -1)"
+    printf 'first_seen: %s\nlast_seen: %s\nslug: %s\ncode: %s\n\n%s\n' \
+      "${first:-unknown}" "$(date -Is)" "$slug" "$code" "$msg" > "$f"
+  else
+    printf 'first_seen: %s\nlast_seen: %s\nslug: %s\ncode: %s\n\n%s\n' \
+      "$(date -Is)" "$(date -Is)" "$slug" "$code" "$msg" > "$f"
+  fi
+  echo "cb-escalations: recorded $key"
+}
+
+cmd_drain() {
+  local key="${1:-}" f n=0
+  shopt -s nullglob
+  if [ -n "$key" ]; then
+    f="$PENDING/$key.msg"
+    [ -f "$f" ] || { echo "cb-escalations: no pending item '$key'" >&2; return 1; }
+    mv "$f" "$DELIVERED/$(basename "$f" .msg).$(date +%Y%m%dT%H%M%S).msg"
+    echo "cb-escalations: drained $key"
+    return 0
+  fi
+  for f in "$PENDING"/*.msg; do
+    mv "$f" "$DELIVERED/$(basename "$f" .msg).$(date +%Y%m%dT%H%M%S).msg"
+    n=$((n + 1))
+  done
+  echo "cb-escalations: drained $n"
+}
+
+case "${1:-}" in
+  --pending) shift; cmd_pending "$@" ;;
+  --record)  shift; cmd_record "$@" ;;
+  --drain)   shift; cmd_drain "$@" ;;
+  *) usage ;;
+esac

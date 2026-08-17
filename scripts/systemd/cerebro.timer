@@ -1,0 +1,12 @@
+# cerebro.timer — keep-alive loop for the Cerebro coordinator session.
+# Fires the oneshot ensure at boot and ~2 min after each completed run.
+[Unit]
+Description=Cerebro coordinator keep-alive
+
+[Timer]
+OnBootSec=30
+OnUnitInactiveSec=120
+AccuracySec=15
+
+[Install]
+WantedBy=timers.target

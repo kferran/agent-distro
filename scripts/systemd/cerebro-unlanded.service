@@ -1,0 +1,25 @@
+# cerebro-unlanded.service — oneshot un-ingested-report sweep, fired hourly by
+# cerebro-unlanded.timer. Read-only: it classifies every finished X-Man report,
+# maintains ~/.cerebro/logs/unlanded-register, and nudges the coordinator ONLY
+# when the unlanded set changes. It never writes the vault, never ingests, and
+# never commits — landing a finding stays with /ingest, which is judgment.
+#
+# WHY A TIMER AND NOT A CRON. The `crons:` entries in the scheduled-tasks-log are
+# CronCreate jobs that live inside a Claude Code host session: they do not
+# survive /clear, /exit, or a restart, which is the whole reason /rearm-crons
+# exists. This sweep's requirement is that it runs without anyone remembering to
+# — a session-scoped job cannot meet that, and the prose rule it replaces failed
+# in exactly that way (it only ran when a fleet tick remembered it, and each
+# fresh-context tick started from the uncorrected version). A user timer with
+# linger survives logout and reboot.
+#
+# Install:
+#   cp scripts/cerebro/systemd/cerebro-unlanded.{service,timer} ~/.config/systemd/user/
+#   systemctl --user daemon-reload && systemctl --user enable --now cerebro-unlanded.timer
+#   loginctl enable-linger kyle   # survive logout/reboot
+[Unit]
+Description=Cerebro un-ingested report sweep (detect only, never lands)
+
+[Service]
+Type=oneshot
+ExecStart=%h/vault/scripts/cerebro/cb-unlanded --tick

@@ -1,0 +1,268 @@
+#!/usr/bin/env bash
+# cb-unlanded [--report|--tick|--backlog|--resolve SLUG|--watch SLUG] — find finished X-Man reports
+# whose finding is not represented in the vault, and keep a register of them.
+#
+# WHY A SIBLING SCRIPT, NOT A cb-ingest MODE. cb-ingest is a WRITER: it holds an
+# additive-only contract, a never-touch path list (cb-ingest:59), a refusal path
+# that appends to the ratify worklist, and a local git commit at cb-ingest:191.
+# This is read-only DETECTION with no write path at all — no vault edit, no
+# commit, no ingest. Bolting a detect mode onto a writer means threading a
+# second contract through its arg parsing and its `no queue -> exit 0` early
+# return, and leaves a reader one flag away from a script whose whole job is to
+# mutate the vault. Two files, two contracts, and the read-only one can be run
+# by anything at any time without asking what it might have changed.
+#
+# WHY THIS EXISTS AT ALL, given cb-reap's queue_ingest + cb-ingest --drain.
+# Those cover a narrower case than the loss they were written for:
+#   * `queue_ingest` (cb-reap:58-80) fires only ON REAP, and only on a task-dir
+#     `report.md`. Every code deliverable lives in a worktree, so none of them
+#     are ever queued.
+#   * It also never fires for a task that finishes and is not reaped — which is
+#     most of them at any given moment.
+#   * `cb-ingest --drain` can only apply a report that DECLARES a machine-
+#     applicable block. Measured on 2026-07-31 across BOTH globs: 0 of 138.
+# So the drain path lands nothing today, and the queue is blind to the worktree
+# lane entirely. Detection is the missing half, and it is not redundant.
+#
+# WHAT IT WILL NOT DO. It does not write the vault, does not ingest, does not
+# guess a destination, does not commit, and does not push. Detecting an unlanded
+# report is not permission to land it. When the set changes it NUDGES the
+# coordinator (the cb-watchlist:149 pattern) and a human runs /ingest, because
+# the destination is judgment and judgment stays with Kyle.
+set -euo pipefail
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$here/lib/unlanded.sh"
+source "$here/lib/paths.sh"
+source "$here/lib/classify.sh"
+
+CB_HOME="${CB_HOME:-$HOME/.cerebro}"
+VAULT="${VAULT_DIR:-$HOME/vault}"
+WORKTREES="${CB_WORKTREES:-$HOME/code/worktrees}"
+REGISTER="$CB_HOME/logs/unlanded-register"
+FINGERPRINT="$CB_HOME/logs/unlanded-fingerprint"
+CB_SESSION="${CB_SESSION:-cb}"
+# The window QUIETS, it never removes — see lib/unlanded.sh's register note.
+: "${CB_UNLANDED_WINDOW_SECS:=172800}"   # 48h
+
+now="$(date +%s)"
+mode=report; resolve_slug=""
+case "${1:---report}" in
+  --report) mode=report;;
+  --backlog) mode=backlog;;
+  --watch)  mode=watch; resolve_slug="${2:-}";
+             [ -n "$resolve_slug" ] || { echo "cb-unlanded: --watch needs a slug" >&2; exit 2; };;
+  --tick)   mode=tick;;
+  --resolve) mode=resolve; resolve_slug="${2:-}";
+             [ -n "$resolve_slug" ] || { echo "cb-unlanded: --resolve needs a slug" >&2; exit 2; };;
+  --blocking) mode=blocking;;
+  *) echo "usage: cb-unlanded {--report|--tick|--backlog|--blocking|--resolve SLUG|--watch SLUG}" >&2; exit 2;;
+esac
+
+# --watch promotes a backlog entry into the watched (never-drops-off) section.
+# The handover case: the prose sweep WAS watching an item before this script
+# existed, and that history lives in the ratify worklist, not in the register.
+if [ "$mode" = watch ]; then
+  cb_require_slug "$resolve_slug" || exit 2
+  ul_register_clear "$REGISTER" "$resolve_slug"
+  ul_register_note "$REGISTER" "$resolve_slug" watched-by-hand "$now" 1
+  echo "cb-unlanded: $resolve_slug promoted to watched — it will not age out"
+  exit 0
+fi
+
+# --blocking answers a NARROWER question than --report, and the difference is the
+# whole point: --report lists every unlanded report (137 at the time this was
+# added, some surfaced 142 times with nothing happening), which is a backlog, not
+# a notification. --blocking lists only the ones where something else is STALLED
+# waiting on them — a dev item whose `hold:`/`blocked:` names the task slug. That
+# item cannot move until someone runs /ingest, and nothing else will ever notice.
+#
+# Kyle 2026-08-07: "I need your help with notifying when we have ingestion needed
+# if it is preventing things from moving forward." A list of unlanded reports is
+# not that; a list of stalled items is.
+#
+# Expect this to print nothing most days. At the time it was written ZERO of 53
+# held dev items were waiting on a report — every hold was a spec gate, a product
+# call, a live assignee or a deliberate pause. It exists because dispatching more
+# work creates the case, not because the case is live.
+if [ "$mode" = blocking ]; then
+  items="$VAULT/00 Inbox"
+  # PERFORMANCE: ask "who is waiting?" BEFORE "what is unlanded?".
+  # The first cut of this classified all ~213 reports and then, per report,
+  # looped every held dev item with an awk+grep — O(tasks x items) subprocesses,
+  # >90s and still unfinished, which would have silently eaten the fleet tick's
+  # budget every hour. The held-slug set is normally EMPTY, so building it first
+  # short-circuits the whole pass to a single grep on the common path.
+  waiting="$(grep -hE '^(hold|blocked):' "$items"/*.md 2>/dev/null || true)"
+  if [ -z "$waiting" ]; then
+    echo "cb-unlanded: nothing blocked on an ingest"
+    exit 0
+  fi
+  found=0
+  for r in "$CB_HOME"/tasks/*/report.md; do
+    [ -f "$r" ] || continue
+    td="$(dirname "$r")"; slug="$(basename "$td")"
+    # cheap test first: is this slug named by ANY hold at all?
+    printf '%s' "$waiting" | grep -qiF -- "$slug" || continue
+    res="$(ul_classify "$td" "$VAULT" "$r")"
+    cls="${res%%	*}"
+    case "$cls" in landed|skip) continue;; esac
+    while IFS= read -r f; do
+      [ -n "$f" ] || continue
+      awk 'NR==1&&/^---/{fm=1;next} fm&&/^---/{exit} fm&&/^(hold|blocked):/' "$f" 2>/dev/null \
+        | grep -qiF -- "$slug" || continue
+      st="$(awk 'NR==1&&/^---/{fm=1;next} fm&&/^---/{exit} fm&&/^status:/{sub(/^status: */,"");print;exit}' "$f")"
+      printf '\xf0\x9f\x94\xb4 %s\n   stalls: %s (status: %s)\n   reason: %s\n   clear with: /ingest %s\n' \
+        "$slug" "$(basename "$f" .md)" "${st:-?}" "${res#*	}" "$slug"
+      found=$((found+1))
+    done <<EOF
+$(grep -rlE '^(hold|blocked):' "$items"/*.md 2>/dev/null)
+EOF
+  done
+  if [ "$found" -eq 0 ]; then
+    echo "cb-unlanded: nothing blocked on an ingest"
+  else
+    printf '\n%s item(s) cannot move until someone ingests the report above.\n' "$found"
+  fi
+  exit 0
+fi
+
+if [ "$mode" = resolve ]; then
+  cb_require_slug "$resolve_slug" || exit 2
+  ul_register_clear "$REGISTER" "$resolve_slug"
+  echo "cb-unlanded: cleared $resolve_slug from the register"
+  exit 0
+fi
+
+# --- collect candidates: BOTH lanes -----------------------------------------
+# Blind spot (a), 2026-07-31: the original single-path scan saw only task-dir
+# reports and was structurally blind to every code deliverable.
+declare -A REPORT_OF=()
+for r in "$CB_HOME"/tasks/*/report.md; do
+  [ -f "$r" ] || continue
+  s="$(basename "$(dirname "$r")")"
+  REPORT_OF["$s"]="$r"
+done
+for r in "$WORKTREES"/*/.ai/specs/*/report.md; do
+  [ -f "$r" ] || continue
+  s="$(basename "$(dirname "$r")")"
+  # a worktree report is the code lane's deliverable — prefer it over a task-dir
+  # stub of the same slug, which is usually the older spawn-time placeholder
+  REPORT_OF["$s"]="$r"
+done
+
+landed=0; skipped=0; codelane=0; live=0
+inwindow=(); aged_now=(); backlog=()
+
+for s in "${!REPORT_OF[@]}"; do
+  rep="${REPORT_OF[$s]}"
+  td="$CB_HOME/tasks/$s"
+
+  # A task still being worked is not unlanded, it is unfinished. NB these two
+  # helpers ECHO a state (alive|gone|unavailable), they do not return a status —
+  # using them as conditions directly reads every task as live and prints "gone".
+  if [ "$(cb_window_alive "$s" 2>/dev/null)" = alive ] \
+  || [ "$(cb_session_present "$s" 2>/dev/null)" = alive ]; then
+    live=$(( live + 1 )); continue
+  fi
+
+  res="$(ul_classify "$td" "$VAULT" "$rep")"
+  class="${res%%$'\t'*}"; reason="${res#*$'\t'}"
+
+  case "$class" in
+    skip)   case "$reason" in
+              "code lane"*) codelane=$(( codelane + 1 ));;
+              *)            skipped=$(( skipped + 1 ));;
+            esac; continue;;
+    landed) landed=$(( landed + 1 )); ul_register_clear "$REGISTER" "$s"; continue;;
+  esac
+
+  # not-represented | blocked-ingest | unknown — all get registered
+  rt="$(stat -c%Y "$rep")"; age=$(( (now - rt) / 3600 ))
+  if [ $(( now - rt )) -le "$CB_UNLANDED_WINDOW_SECS" ]; then
+    ul_register_note "$REGISTER" "$s" "$class" "$now" 1
+    inwindow+=("$s|$class|${age}h|$reason")
+  else
+    ul_register_note "$REGISTER" "$s" "$class" "$now" 0
+    if [ "$(ul_register_origin "$REGISTER" "$s")" = watched ]; then
+      aged_now+=("$s|$class|${age}h|$reason")     # aged out UNDER OBSERVATION
+    else
+      backlog+=("$s|$class|${age}h|$reason")      # predates the register
+    fi
+  fi
+done
+
+# --- render ------------------------------------------------------------------
+emit() {
+  printf 'cb-unlanded — %s\n' "$(TZ=America/Denver date +%FT%H:%M)"
+  printf '  scanned %d reports (%d landed, %d live, %d non-terminal, %d code-lane)\n\n' \
+    "${#REPORT_OF[@]}" "$landed" "$live" "$skipped" "$codelane"
+
+  if [ "${#inwindow[@]}" -eq 0 ]; then
+    printf 'In window (<=%dh): clean\n' $(( CB_UNLANDED_WINDOW_SECS / 3600 ))
+  else
+    printf 'In window (<=%dh) — %d unlanded:\n' $(( CB_UNLANDED_WINDOW_SECS / 3600 )) "${#inwindow[@]}"
+    for e in "${inwindow[@]}"; do
+      IFS='|' read -r s c a r <<< "$e"
+      printf '  %-14s %-38s %5s  %s\n' "$c" "$s" "$a" "$r"
+    done
+  fi
+
+  # The section the old sweep did not have. `e2e-product-findings-tickets` was
+  # surfaced at 46h and 47h and then vanished at 48h, still unlanded. Nothing
+  # leaves here by getting old — only by landing or by an explicit --resolve.
+  if [ "${#aged_now[@]}" -gt 0 ]; then
+    printf '\nAged past the window — STILL UNLANDED, %d (never drops off):\n' "${#aged_now[@]}"
+    for e in "${aged_now[@]}"; do
+      IFS='|' read -r s c a r <<< "$e"
+      surf="$(grep "^$s	" "$REGISTER" 2>/dev/null | sed -n 's/.*surfaces=\([0-9]*\).*/\1/p')"
+      printf '  %-14s %-38s %5s  (surfaced %sx)  %s\n' "$c" "$s" "$a" "${surf:-1}" "$r"
+    done
+    printf '\n  Clear one with: cb-unlanded --resolve <slug>\n'
+  fi
+
+  # Pre-existing backlog: already past the window the first time the sweep ran,
+  # so it was never under observation. Counted, not listed — this is the class
+  # that would otherwise flood the report with 85 historical lines on run one.
+  if [ "${#backlog[@]}" -gt 0 ]; then
+    printf '\nPre-dating the register: %d unlanded (never watched in-window).\n' "${#backlog[@]}"
+    printf '  Not a disappearance — historical backlog. List with: cb-unlanded --backlog\n'
+  fi
+}
+if [ "$mode" = backlog ]; then
+  printf 'cb-unlanded — pre-existing backlog (%d)\n\n' "${#backlog[@]}"
+  for e in ${backlog[@]+"${backlog[@]}"}; do
+    IFS='|' read -r s c a r <<< "$e"
+    printf '  %-16s %-46s %6s  %s\n' "$c" "$s" "$a" "$r"
+  done
+  exit 0
+fi
+emit
+
+[ "$mode" = tick ] || exit 0
+
+# --- tick: nudge the coordinator, but only when the set CHANGED --------------
+# An hourly nudge that says the same thing every hour is noise, and noise is how
+# the prose sweep got ignored. Fingerprint the unlanded set; nudge on change.
+fp="$(printf '%s\n' ${inwindow[@]+"${inwindow[@]}"} ${aged_now[@]+"${aged_now[@]}"} \
+      | cut -d'|' -f1,2 | sort | cksum | cut -d' ' -f1)"
+prev="$(cat "$FINGERPRINT" 2>/dev/null || true)"
+total=$(( ${#inwindow[@]} + ${#aged_now[@]} ))
+mkdir -p "$CB_HOME/logs"
+
+[ "$fp" = "$prev" ] && exit 0
+[ "$total" -gt 0 ] || exit 0
+[ "$(cat "$CB_HOME/mode" 2>/dev/null)" = "focus" ] && exit 0
+
+# The fingerprint advances ONLY after a delivered send. Writing it first means a
+# tick that fires while the coordinator is down loses the nudge permanently — the
+# set is unchanged next hour, so it never re-fires and the finding stays silent.
+# That is the same "runs only if something happened to be listening" hole this
+# script exists to close, so a failed send must leave the fingerprint alone and
+# let the next tick retry.
+tmux="${CB_TMUX_BIN:-tmux}"
+"$tmux" send-keys -t "$CB_SESSION" \
+  "cb-unlanded reports $total unlanded finding(s) — run \`scripts/cerebro/cb-unlanded\` and surface them; do NOT auto-ingest" 2>/dev/null || exit 0
+sleep "${CB_SEND_DELAY:-0.3}"
+"$tmux" send-keys -t "$CB_SESSION" Enter 2>/dev/null || true
+printf '%s\n' "$fp" > "$FINGERPRINT"
+printf '%s cb-unlanded nudged (%d unlanded)\n' "$(date -Is)" "$total" >> "$CB_HOME/logs/events"

@@ -1,0 +1,491 @@
+#!/usr/bin/env bash
+# scripts/cerebro/cb-send <slug> <line>
+# Target resolves from the task meta: research tasks are windows in the "cb"
+# session (cb:<slug>); code tasks are per-slug sessions (<slug>:, ratified
+# 2026-07-12).
+#
+# cb-send delivers ONE short line. A LONG prompt pasted via send-keys submits
+# unreliably (7/15 live session: multi-line pastes land typed-but-unsubmitted,
+# same root cause as the 7/13 Enter-split hotfix below, worse at length). Reliable
+# delivery for a long prompt is: write it to a file, then send a one-liner
+# "read <file> and execute." (cb-start already does this — launch-line + launch.sh.)
+# Since (e) below, cb-send applies that discipline itself — a payload over
+# CB_SEND_MAX_INLINE is filed and replaced with a pointer — so callers no longer
+# have to remember the rule, and the composer verification downstream checks the
+# pointer, which is what actually gets typed.
+# The general composer/empty-pane guard for this shared channel is R17 (steps 9-10).
+#
+# DELIVERY VERIFICATION (2026-07-24). The 7/13 Enter-split hotfix reduced but did
+# not eliminate the strand: for an idle-at-a-prompt or busy composer the Enter is
+# still swallowed and the message sits typed-but-unsubmitted (observed 4x on 7/24;
+# two live strands found while writing this — a code conductor and the coordinator
+# pane itself). cb-send now READS BACK the composer and recovers.
+#
+# Why the composer box and not the TUI chrome: lib/coordinator.sh keys its guard on
+# `? for shortcuts` / `esc to interrupt`. Neither string appears in ANY live pane on
+# the current Claude-Code build (verified 7/24 across all 6 sessions) — chrome
+# strings drift per version. The composer box does not:
+#
+#     ────────────────────────────────────────────────────   <- rule
+#     ❯ <message text, wrapped>                              <- prompt + contents
+#     ────────────────────────────────────────────────────   <- rule
+#
+# So: extract the contents between the LAST `❯` prompt and its closing rule, and
+# ask one version-independent question — "is MY message still sitting in there?"
+# Empty composer, or contents that aren't ours, both mean delivered (a busy agent
+# queues the message and clears the composer, which reads the same).
+#
+# NOTE: an EMPTY composer is `❯` followed by U+00A0 (a non-breaking space), not an
+# ASCII space — hence the NBSP normalization in _cb_composer. Without it every
+# empty composer reads as non-empty and the guard inverts. The same NBSP is why
+# the ghost test below is a substring-survival check and never a line match.
+#
+# GHOST COMPOSERS (2026-08-03). A composer can PAINT a previously-recalled input
+# it is not holding. Text on screen is therefore not proof of pending input, so
+# the holds-other-text refusal probes before it refuses — see _cb_is_ghost. And
+# because a guard that can never be satisfied strands a task forever, a second
+# refusal for the same reason opens a board decision — see _cb_refuse.
+#
+# Exit codes: 0 delivered (or unverifiable — see below); 3 refused, composer holds
+# someone else's text; 4 NOT DELIVERED after the retry ladder.
+#
+# Unverifiable panes (no `❯` found: a dead login shell, a spend-wedge screen, a
+# future TUI that renames the glyph) send as before and exit 0 with a warning on
+# stderr — this path is deliberately no-regression, since a hard failure here would
+# abort cb-remediate mid-resume under `set -e`.
+set -euo pipefail
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"; source "$here/lib/paths.sh"; source "$here/lib/classify.sh"
+# R1 (firstmate fm-guard): who-watches-the-watcher rides every command the
+# coordinator runs — warns only (events + coordinator session + push), never blocks.
+"${CB_GUARD_CMD:-$here/cb-guard}" >/dev/null 2>&1 || true
+tmux="${CB_TMUX_BIN:-tmux}"; slug="$1"; shift
+td="$(cb_task_dir "$slug")"
+if grep -q '^kind=code$' "$td/meta" 2>/dev/null; then
+  target="$slug:"
+else
+  target="cb:$slug"
+fi
+msg="$*"
+# (e) scope-add #2: a long payload pasted via send-keys trips Claude Code's
+# bracketed-paste collapse ("[Pasted text] — paste again to expand"), landing
+# typed-but-unsubmitted (hit live 7/15). Over CB_SEND_MAX_INLINE, write the
+# payload to a file and send a short "Read <file>" pointer instead — the same
+# file-pointer discipline cb-start's launch.sh uses for the launch prompt.
+# Done HERE, before `probe` and the composer guards below are computed off $msg,
+# so every downstream check (idempotency, strand detection, retype) works on the
+# pointer that is actually typed rather than on the payload it replaced.
+if [ "${#msg}" -gt "${CB_SEND_MAX_INLINE:-200}" ]; then
+  mkdir -p "$td"
+  msgfile="$(mktemp "$td/send-msg.XXXXXX")"
+  printf '%s' "$msg" > "$msgfile"
+  msg="Read $msgfile and follow it (cb-send routed a long message to a file to avoid paste truncation)."
+fi
+
+: "${CB_SEND_DELAY:=0.3}"      # pause between typing and the separate Enter (7/13)
+: "${CB_VERIFY_DELAY:=0.6}"    # let the TUI redraw before reading the composer back
+: "${CB_SEND_RETRIES:=3}"      # recovery rungs: Enter, then retype, then retype
+# How long to WAIT for a composer to appear before refusing (2026-07-30). A freshly
+# spawned harness has no composer for several seconds — much longer under load — and
+# the old behaviour was to type into it anyway and report success. See the refusal
+# below for what that cost.
+: "${CB_COMPOSER_WAIT_SECS:=45}"
+: "${CB_COMPOSER_POLL_SECS:=1}"
+# CB_SEND_ALLOW_BLIND=1 — the ONE sanctioned way to type into a pane with no
+# composer. Exists for cb-remediate, whose entire job is nudging a WEDGED agent:
+# a spend-limit / usage-wall screen never shows a composer, so "wait for one" can
+# never succeed there and a refusal would silently disable auto-remediation.
+# Everything else must not set this. Blind-typing into a pane you cannot read is
+# how five briefs were lost on 2026-07-30; the default is refusal for a reason.
+: "${CB_SEND_ALLOW_BLIND:=0}"
+
+# _cb_code_task — is this a per-slug conductor SESSION (as opposed to a window in
+# the shared `cb` session)? Only code sessions outlive their agent, so only they
+# can present the dead-pane hazard below.
+_cb_code_task() { grep -q '^kind=code$' "$td/meta" 2>/dev/null; }
+# _cb_target_alive — HARNESS liveness of the pane we are about to type at:
+# alive | gone | unavailable, from the same probe classify and cb-start use.
+_cb_target_alive() { cb_session_alive "$slug"; }
+
+# _cb_pane — the target pane's tail. CB_PANE_CMD-mockable (tests point it at a
+# fixture); an unreadable pane degrades to empty output, never to a hard error.
+_cb_pane() {
+  if [ -n "${CB_PANE_CMD:-}" ]; then
+    eval "$CB_PANE_CMD" 2>/dev/null || true
+  else
+    "$tmux" capture-pane -p -t "$target" 2>/dev/null | tail -40 || true
+  fi
+}
+
+# _cb_composer — the composer's current contents, whitespace-squeezed. Returns 1
+# (unreadable) when the pane is empty or carries no `❯` prompt at all; prints the
+# empty string when the composer is present and empty.
+_cb_composer() {
+  local pane ln body out="" first=1 l
+  pane="$(_cb_pane)"
+  [ -n "$pane" ] || return 1
+  ln="$(printf '%s\n' "$pane" | grep -n '^[[:space:]]*❯' | tail -1 | cut -d: -f1)"
+  [ -n "$ln" ] || return 1
+  body="$(printf '%s\n' "$pane" | tail -n +"$ln")"
+  while IFS= read -r l; do
+    if [ "$first" = 1 ]; then
+      first=0
+      l="$(printf '%s' "$l" | sed 's/^[[:space:]]*❯//')"
+    else
+      # a wrapped message continues on the following lines; the closing rule ends it
+      printf '%s' "$l" | grep -q '^[[:space:]]*─' && break
+    fi
+    out="$out $l"
+  done <<< "$body"
+  # U+00A0 → space (an empty composer is `❯` + NBSP), then squeeze and trim
+  printf '%s' "$out" | sed $'s/\302\240/ /g' | tr -s '[:space:]' ' ' | sed 's/^ //; s/ $//'
+}
+
+# _cb_needle TEXT — the leading slice of TEXT, for use as a fixed-string needle
+# against a composer read. Kept short so it can never straddle the composer's
+# line wrap, and cut on a WORD boundary: a byte-wise truncation could split a
+# multibyte character, and a needle with a broken byte sequence never matches.
+# The composer is full of multibyte glyphs (`❯`, box rules, the NBSP separator),
+# so this is not a theoretical concern here.
+_cb_needle() {
+  local squeezed word out=""
+  squeezed="$(printf '%s' "$1" | tr -s '[:space:]' ' ' | sed 's/^ //; s/ $//')"
+  for word in $squeezed; do
+    [ -z "$out" ] || [ "${#out}" -lt 30 ] || break
+    out="${out:+$out }$word"
+  done
+  printf '%s' "$out"
+}
+
+# _cb_probe — _cb_needle over OUR outgoing message. A needle that failed to match
+# would fail toward a false "delivered", the one unsafe direction. (A single
+# >40-char word is its own probe; if that straddles the wrap the send degrades to
+# unverified, never to a retype.)
+_cb_probe() { _cb_needle "$msg"; }
+probe="$(_cb_probe)"
+
+# _cb_stranded TEXT — is our message still sitting unsent in the composer?
+_cb_stranded() { [ -n "$probe" ] && printf '%s' "$1" | grep -qF -- "$probe"; }
+
+_cb_type()   { "$tmux" send-keys -t "$target" "$msg"; }
+_cb_submit() { "$tmux" send-keys -t "$target" Enter; }
+
+# --- ghost composer (2026-08-03) ---------------------------------------------
+# The composer paints a previously-recalled input the way a shell paints a
+# history entry: the glyph, the separator and the old text are all on screen, but
+# nothing is pending. capture-pane cannot tell that frame from live typing, so
+# the holds-other-text refusal below fired against an EMPTY composer — and since
+# nothing ever clears a ghost, the refusal was PERMANENT. One finished conductor
+# sat unreachable for over an hour on 2026-08-02; `cb-start --code --adopt`
+# refuses in the same state (correctly — the harness really is alive), so both
+# recovery paths failed together.
+#
+# Make the composer answer for itself. Type one innocuous character and ask
+# whether the ORIGINAL text SURVIVED:
+#
+#   gone      → the character REPLACED a rendered frame → ghost → composer free
+#   still there → the character APPENDED to live input → real pending text
+#
+# ⚠️ Substring survival, deliberately — never an exact-line match. The separator
+# after `❯` is U+00A0, not `0x20` (`od -c`: `342 235 257  302 240`), so any
+# comparison written with an ordinary space can never match and reports every
+# ghost as pending, permanently. That bit twice in one hour on 2026-08-02, the
+# second time inside the code written to avoid the first. Asking whether known
+# content survived assumes nothing about separators, padding or Unicode. Do not
+# reintroduce an exact-line match on this path.
+: "${CB_GHOST_PROBE_CHAR:=Q}"
+
+# WHY THIS IS SAFE TO RUN UNGATED, when the dead-harness refusal above is scoped
+# to code tasks. The probe types at whatever the pane is, so "could this pane be
+# a shell?" has to be answered for BOTH task kinds, and the answer differs by how
+# cb-start launches them:
+#   code    — launch.sh ends `exec bash` (cb-start:189), so the pane ROOT becomes
+#             a shell that outlives the harness. That is the whole hazard, and it
+#             is why the `gone` refusal above exits before we ever reach here.
+#             By this line a code pane is `alive` or `unavailable`, never `gone`.
+#   research/ops — launch.sh ends `exec env … claude …` (cb-start:498/589), so the
+#             HARNESS is the window root. When it exits the window exits with it;
+#             tmux destroys the window and capture-pane returns nothing, which
+#             _cb_await_composer turns into the no-composer refusal. There is no
+#             surviving shell to type at, which is also why _cb_target_alive is
+#             not consulted for them — it resolves a SESSION named <slug>, and a
+#             research task is a WINDOW in the shared `cb` session.
+# Either way, no Enter is pressed on this path: the probe is one character and
+# one BSpace. _cb_type/_cb_submit run only on the ghost arm, which requires a
+# readable composer that responded to the probe.
+#
+# _cb_is_ghost PRE — 0 iff the composer text PRE is a rendered ghost and the
+# composer is therefore free. Restores the composer on BOTH arms.
+#
+# Fails toward the refusal, always: an unreadable post-probe pane is not evidence
+# of freedom, and a needle we could not compute is not evidence of anything. The
+# cost of a wrong "ghost" is typing over Kyle mid-sentence; the cost of a wrong
+# "pending" is one refusal, which the recurrence guard below then surfaces.
+_cb_is_ghost() {
+  local needle post rc=0
+  needle="$(_cb_needle "$1")"
+  [ -n "$needle" ] || return 1
+  "$tmux" send-keys -t "$target" "$CB_GHOST_PROBE_CHAR"
+  sleep "$CB_VERIFY_DELAY"
+  post="$(_cb_composer)" || rc=1
+  # Unconditional, before the branch: on the pending arm this takes the probe
+  # character back off Kyle's real input, and on the ghost arm it leaves the
+  # composer as we found it for _cb_type below.
+  "$tmux" send-keys -t "$target" BSpace
+  sleep "$CB_SEND_DELAY"
+  [ "$rc" = 0 ] || return 1
+  if printf '%s' "$post" | grep -qF -- "$needle"; then return 1; fi
+  return 0
+}
+
+# --- refusal recurrence (2026-08-03) -----------------------------------------
+# A guard that can never be satisfied is worse than the strand it prevents. Every
+# refusal is now counted per (slug, reason); the SECOND consecutive refusal for
+# the same reason opens a board decision, so a task that has become unreachable
+# says so instead of failing identically forever.
+#
+# `blocked`, not `needs-input`: needs-input drives cb-notify's hard interrupt,
+# which delivers through cb_coord_send and the R17 composer guard — routing a
+# delivery fault back through the delivery path. `blocked` renders in
+# cb-board's own arm and surfaces without that blast radius.
+#
+# The counter is keyed on the REASON, so a no-composer followed by a
+# holds-other-text is two different first refusals, not a recurrence. Delivery
+# clears it (and the R12 sweep at the bottom resolves the decision itself).
+#
+# It is NOT time-bounded, and that is deliberate rather than an oversight: two
+# refusals a week apart still count as a recurrence. The question being asked is
+# "is this channel stuck?", and a channel nobody has successfully sent on since
+# the last refusal has not recovered — it has only been quiet. Delivery is the
+# reset, elapsed time is not.
+_cb_refuse() {   # _cb_refuse <reason-kind> <operator message>
+  local kind="$1" note="$2" prev="" n=1 key
+  echo "cb-send: refusing — $note" >&2
+  if [ -d "$td" ]; then
+    prev="$(cat "$td/send-refusals" 2>/dev/null || true)"
+    [ "${prev%% *}" = "$kind" ] && n=$(( ${prev##* } + 1 ))
+    printf '%s %s\n' "$kind" "$n" > "$td/send-refusals"
+    if [ "$n" -ge 2 ]; then
+      key="$(_decision_key blocked "cb-send cannot reach $slug ($kind)")"
+      _decision_open "$td" "$key" blocked "cb-send cannot reach $slug ($kind) — refused $n times for the same reason; delivery is stuck, not retrying"
+      echo "cb-send: SURFACED — $slug has now been refused $n times for '$kind'; opened a blocked decision on the board rather than failing quietly again" >&2
+    fi
+  fi
+  exit 3
+}
+_cb_refusals_clear() { [ -d "$td" ] && rm -f "$td/send-refusals"; return 0; }
+
+# _cb_await_composer — poll for a composer up to CB_COMPOSER_WAIT_SECS. Echoes the
+# composer contents and returns 0 the moment one is readable; returns 1 if the window
+# elapses without one ever appearing.
+#
+# WHY THIS EXISTS (2026-07-30). cb-send used to treat "no composer" as "send blind":
+# it typed the message, pressed Enter, and exited 0. Against a harness that has not
+# finished booting that types into nothing — the message is lost and the caller is
+# told it was delivered. On 2026-07-30 five recovery conductors were adopted and
+# briefed in one pass at load 48; all five booted slowly, all five briefs went into
+# the void, and all five agents sat at a bare `running` beacon having never received
+# an instruction. cb-send reported success for every one of them.
+#
+# A spawn is exactly when a caller most needs delivery to be real, and exactly when
+# the composer is most likely to be missing. So: wait, then refuse. Never type blind.
+_cb_await_composer() {
+  local out deadline
+  # A caller that has opted into a blind send is asserting it targets a pane with
+  # no composer (cb-remediate nudging a wedge screen). Probe ONCE and give up —
+  # waiting the full window there would add CB_COMPOSER_WAIT_SECS of latency to
+  # every remediation attempt for an outcome the caller already expects.
+  if [ "$CB_SEND_ALLOW_BLIND" = 1 ]; then
+    if out="$(_cb_composer)"; then printf '%s' "$out"; return 0; fi
+    return 1
+  fi
+  # A real deadline in wall-clock seconds, not a poll count. The poll interval is
+  # tunable (and fractional in tests), so counting iterations would make
+  # CB_COMPOSER_WAIT_SECS mean "polls" and silently lie about its own name.
+  deadline=$(( $(date +%s) + CB_COMPOSER_WAIT_SECS ))
+  while :; do
+    if out="$(_cb_composer)"; then printf '%s' "$out"; return 0; fi
+    [ "$(date +%s)" -lt "$deadline" ] || return 1
+    sleep "$CB_COMPOSER_POLL_SECS"
+  done
+}
+
+# --- auto-re-adopt a dead conductor session (2026-07-30) ---------------------
+# THE POINT OF THE WHOLE CHANGE: make answering a cb-ask cost one command.
+#
+# A conductor that needs a decision runs cb-ask, which parks its beacon at
+# `paused:` — and then its turn ends, which ends its agent. The session and the
+# worktree now survive that (cb-start no longer `exec`s the harness), but the pane
+# is a bare shell: there is nobody left to read the answer. Until now Kyle had to
+# notice that, run cb-start --code --adopt by hand, wait for the harness, and only
+# then cb-send. Four steps to answer a question.
+#
+# So do it here. If the target is a code task whose harness is GONE and whose
+# beacon says it is waiting on a human (paused/blocked — exactly what cb-ask
+# writes), re-adopt it, then deliver.
+#
+# THIS MUST NOT WEAKEN THE REFUSAL ABOVE, and the ordering is what guarantees it:
+# the re-adopt runs BEFORE _cb_await_composer, never instead of it. A re-adopt
+# that fails, or that comes up without a composer, still lands in the same exit-3
+# refusal as any other composerless pane. Nothing is ever typed at that shell.
+#
+# Deliberately narrow — every skipped case falls through to the normal path:
+#   - research/ops tasks (windows, not sessions) — adopt is a code-path verb
+#   - `alive` (an agent is working) or `unavailable` (cannot tell — asymmetry rule)
+#   - any beacon state other than paused/blocked, so a merely-finished session is
+#     not resurrected by a stray message
+#   - a task carrying a terminal signal (summary/done/merged PR) — reaped work
+#     stays reaped
+#   - no `target=` or a missing worktree in the meta: cb-start --adopt requires
+#     both, so there is nothing to adopt onto
+_cb_readopt_if_dead() {
+  local tgt wt jira_key rc=0
+  _cb_code_task || return 0
+  [ "$(_cb_target_alive)" = "gone" ] || return 0
+  case "$(_beacon_state "$td/status" 2>/dev/null)" in paused|blocked) ;; *) return 0;; esac
+  if [ -f "$td/summary.md" ] || [ -f "$td/done" ] || [ "$(cat "$td/pr.state" 2>/dev/null)" = "MERGED" ]; then
+    return 0
+  fi
+  tgt="$(_meta_field "$td" target)";   [ -n "$tgt" ] || return 0
+  wt="$(_meta_field "$td" worktree)";  [ -n "$wt" ] && [ -d "$wt" ] || return 0
+  jira_key="$(_meta_field "$td" jira)"
+  echo "cb-send: $slug has an answer waiting but its harness has exited — re-adopting before delivery" >&2
+  # </dev/null: cb-start refuses when bytes are waiting on its stdin (a piped
+  # brief used to be eaten silently — 2026-07-31). This recovery has nothing to do
+  # with briefs, so it must not inherit whatever our caller left on the pipe.
+  eval "${CB_START_CMD:-$here/cb-start}" --code --adopt "$slug" --target "$tgt" \
+    ${jira_key:+--jira "$jira_key"} --worktree "$wt" >&2 </dev/null || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    # Not fatal: fall through and let the composer wait have its say. If a harness
+    # did come up anyway we still deliver; if not, the refusal below is the answer.
+    echo "cb-send: warn — re-adopt of $slug failed (exit $rc); continuing to the composer check" >&2
+  fi
+  return 0
+}
+_cb_readopt_if_dead
+
+# --- dead-harness refusal: the process probe outranks the pane text -----------
+# CAUGHT LIVE 2026-07-30, and the reason this gate is not optional. The composer
+# guard below reads the PANE, and pane text lies once a session outlives its
+# agent: an exiting harness leaves its final TUI frame on screen — `❯`, rules and
+# all — and the trailing `exec bash` merely prints a prompt underneath it.
+# capture-pane still shows that GHOST COMPOSER, so _cb_composer reports a perfectly
+# ordinary empty composer for a pane whose only living process is a shell. The
+# end-to-end demo typed a payload at exactly such a pane and a `touch` in
+# backticks REALLY RAN. The wait-then-refuse guard never fired, because from the
+# text's point of view there was nothing wrong.
+#
+# So text cannot be the authority here. The process probe can't be spoofed by
+# leftover pixels: ask whether a harness is running, and refuse if it positively
+# is not — however inviting the pane looks.
+#
+# Scoped to code tasks because that is exactly where the hazard was introduced.
+# Research/ops agents are WINDOWS launched with `exec`, so their window dies with
+# the harness and never leaves a readable ghost behind.
+#
+# Placed AFTER the re-adopt above, never instead of it: a conductor that was
+# successfully revived is alive again by now and passes straight through.
+# Asymmetry rule (lib/classify.sh): only a positive `gone` refuses — `unavailable`
+# means we cannot tell, and keeps today's answer.
+if _cb_code_task && [ "$(_cb_target_alive)" = "gone" ]; then
+  _cb_refuse dead-harness "no live harness in session $slug. The pane is a bare shell (any composer on screen is a leftover frame), so the message would be EXECUTED, not typed. NOTHING was sent; re-adopt the slug first."
+fi
+
+# --- pre-send guard (idempotency) -------------------------------------------
+# Typing into a composer that already holds text concatenates two payloads into one
+# corrupted turn. Three cases: unreadable → send as before; holds OUR message (a
+# previous cb-send stranded it) → submit only, never retype; holds ANYTHING else
+# (Kyle mid-type) → refuse.
+verify=1
+if pre="$(_cb_await_composer)"; then
+  if _cb_stranded "$pre"; then
+    :                                     # already typed — go straight to submit
+  elif [ -n "$pre" ]; then
+    # An interactive option menu also renders `❯ <text>`, so it reads here as a
+    # composer holding text — and it is NOT a ghost. It is the agent asking Kyle
+    # directly, and a stray keystroke at a selection list is a real answer.
+    # Refuse without probing. (CB_MENU_PATTERN is classify.sh's, single-sourced,
+    # and this arm is a no-regression: a menu already refused before the probe
+    # existed. A false positive here costs one refusal; a probe fired at a live
+    # menu costs a wrong decision.)
+    if printf '%s\n' "$(_cb_pane)" | grep -qE "$CB_MENU_PATTERN"; then
+      _cb_refuse menu "$target is at an interactive option menu, not a free composer: ${pre:0:60}. The agent is asking YOU — answer it in the pane. NOTHING was sent."
+    fi
+    if _cb_is_ghost "$pre"; then
+      echo "cb-send: $target's composer text is a GHOST (a rendered frame, not pending input) — the composer is free; delivering" >&2
+      _cb_type
+      sleep "$CB_SEND_DELAY"
+    else
+      _cb_refuse pending-text "$target composer already holds other text: ${pre:0:60}"
+    fi
+  else
+    _cb_type
+    sleep "$CB_SEND_DELAY"
+  fi
+else
+  # No composer after the full wait. REFUSE — do not type. Typing here is how a
+  # message gets silently swallowed by a booting harness (or executed by a bare
+  # shell, if the pane's agent has exited). Exit 3 is the same "refused, nothing
+  # sent" contract the composer-holds-other-text branch above uses, so callers
+  # already handle it.
+  if [ "$CB_SEND_ALLOW_BLIND" = 1 ]; then
+    # Sanctioned blind send (cb-remediate only). The caller has asserted it is
+    # deliberately targeting a composerless pane. Delivery is unverifiable by
+    # construction, so mark it so and let the caller decide what that means.
+    verify=0
+    _cb_type
+    sleep "$CB_SEND_DELAY"
+  else
+    _cb_refuse no-composer "no composer on $target after ${CB_COMPOSER_WAIT_SECS}s (harness not ready, or the pane is not an agent). NOTHING was sent; retry once it is up."
+  fi
+fi
+_cb_submit
+
+# --- verify + recover ---------------------------------------------------------
+delivered=0
+if [ "$verify" = 1 ]; then
+  attempt=0
+  while :; do
+    sleep "$CB_VERIFY_DELAY"
+    if ! now="$(_cb_composer)"; then verify=0; break; fi   # went unreadable mid-flight
+    _cb_stranded "$now" || { delivered=1; break; }
+    # Confirm the strand on a SECOND delayed read before ANY recovery keystroke.
+    # A stale capture frame would otherwise make us act on an already-delivered
+    # message — and if the agent has moved on to a y/n prompt, even a stray Enter
+    # picks a default. Costs one extra read, and only when a strand is suspected.
+    sleep "$CB_VERIFY_DELAY"
+    if ! now="$(_cb_composer)"; then verify=0; break; fi
+    _cb_stranded "$now" || { delivered=1; break; }
+    attempt=$(( attempt + 1 ))
+    [ "$attempt" -le "$CB_SEND_RETRIES" ] || break
+    if [ "$attempt" = 1 ]; then
+      _cb_submit                          # cheapest rung: the Enter was swallowed
+    else
+      "$tmux" send-keys -t "$target" C-u   # clear, then retype clean
+      sleep "$CB_SEND_DELAY"
+      _cb_type
+      sleep "$CB_SEND_DELAY"
+      _cb_submit
+    fi
+  done
+fi
+
+if [ "$verify" = 1 ] && [ "$delivered" = 0 ]; then
+  # Leave the message IN the composer: it is the only copy, it is visible to Kyle,
+  # and a re-run takes the submit-only path above rather than retyping over it.
+  echo "cb-send: NOT DELIVERED — message still in the $target composer after $CB_SEND_RETRIES recovery attempts; left in place, submit it by hand" >&2
+  exit 4
+fi
+[ "$verify" = 1 ] || echo "cb-send: warning — could not read a composer on $target; delivery unverified" >&2
+
+# Reaching here means the message went out (or went out unverifiably). The
+# recurrence counter is about a channel that is STUCK, so any delivery resets it;
+# the R12 sweep just below closes the blocked decision it may have opened.
+_cb_refusals_clear
+
+# R12: a human answer via cb-send is the coordinator-MARKED close — it resolves
+# the slug's currently-open decision(s). (The watcher only DERIVES `open`; the
+# lifecycle close is coordinator-owned — decision #1.) Only on a delivered (or
+# unverifiable-but-sent) path: a message that never landed must not close a gate.
+while IFS=$'\t' read -r dk _; do
+  [ -n "$dk" ] && _decision_resolve "$td" "$dk"
+done < <(open_decisions "$td")

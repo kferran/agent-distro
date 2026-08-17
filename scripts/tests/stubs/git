@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# reads $CB_HOME/git/<key> files the test seeds: ahead, pushed
+case "$*" in
+  *"rev-list --count"*) cat "$CB_HOME/git/ahead" 2>/dev/null || echo 0;;
+  *"ls-remote"*) cat "$CB_HOME/git/pushed" 2>/dev/null;;
+  *) echo "";;
+esac

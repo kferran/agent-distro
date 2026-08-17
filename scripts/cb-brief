@@ -1,0 +1,200 @@
+#!/usr/bin/env bash
+# scripts/cerebro/cb-brief --research <slug> [--target <project>]
+#                 cb-brief --ops      <slug> [--target <project>]
+#                 cb-brief --code <slug> --target <project> [--jira <KEY>] [--worktree <path>]
+# --code writes context.md into the conductor run dir (<worktree>/.ai/specs/<slug>/)
+# — the one file scripts are sanctioned to write on the conductor side. Runs
+# AFTER cb-start --code created the worktree (code runs start-then-brief; the
+# dispatch skill calls them in order and fills the sections from the dev item).
+# Never touches the vault — dev-item lifecycle edits are the dispatch skill's job.
+set -euo pipefail
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"; source "$here/lib/paths.sh"; source "$here/lib/registry.sh"; source "$here/lib/land.sh"
+mode=""; slug=""; target=""; jira=""; worktree=""
+while [ $# -gt 0 ]; do case "$1" in
+  --research) [ $# -ge 2 ] || { echo "cb-brief: --research requires a slug" >&2; exit 2; }; mode=research; slug="$2"; shift 2;;
+  --ops) [ $# -ge 2 ] || { echo "cb-brief: --ops requires a slug" >&2; exit 2; }; mode=ops; slug="$2"; shift 2;;
+  --code) [ $# -ge 2 ] || { echo "cb-brief: --code requires a slug" >&2; exit 2; }; mode=code; slug="$2"; shift 2;;
+  --target) [ $# -ge 2 ] || { echo "cb-brief: --target requires a project" >&2; exit 2; }; target="$2"; shift 2;;
+  --jira) [ $# -ge 2 ] || { echo "cb-brief: --jira requires a key" >&2; exit 2; }; jira="$2"; shift 2;;
+  --worktree) [ $# -ge 2 ] || { echo "cb-brief: --worktree requires a path" >&2; exit 2; }; worktree="$2"; shift 2;;
+  *) echo "cb-brief: unknown arg $1" >&2; exit 2;; esac; done
+[ -n "$slug" ] || { echo "cb-brief: slug required" >&2; exit 2; }
+cb_require_slug "$slug" || exit 2
+
+if [ "$mode" = "code" ]; then
+  # --target is required in code mode (mirrors cb-start:26): it's written into
+  # the task meta that cb-pr-check/cb-merge/cb-review read for the registry row.
+  # An empty target would overwrite meta with a blank target= line.
+  [ -n "$target" ] || { echo "cb-brief: --code requires --target <project>" >&2; exit 2; }
+  # conductor-native home (spec §3) — NOT $CB_HOME/worktrees. The root comes from
+  # the target's registry row (T39), the same resolution cb-start uses to CREATE
+  # it: a vault row lives under the vault's own .claude/worktrees, and defaulting
+  # to ~/code/worktrees here would look for the worktree in the Ultron tree and
+  # exit 1 on a worktree cb-start had just created correctly.
+  [ -n "$worktree" ] || worktree="$(registry_worktree_root "$target")/$slug"
+  [ -d "$worktree" ] || { echo "cb-brief: worktree $worktree does not exist — run cb-start --code first (or pass --worktree)" >&2; exit 1; }
+  # CB_SPECS_ROOT, not a hardcoded `.ai/specs` (aligned 2026-08-03). conductor.sh's
+  # resolve_run, cb-start's adopt marker and cb-resume all honour that variable; this
+  # was the one writer that did not. Set it and cb-brief would write context.md
+  # somewhere nobody reads — cb-resume would see a permanently missing context.md,
+  # re-brief on every resume, and splice into a file the agent never opens. Unset
+  # today, so this is a no-op that closes the trap rather than a behaviour change.
+  specs_root="${CB_SPECS_ROOT:-.ai/specs}"
+  rundir="$worktree/$specs_root/$slug"
+  mkdir -p "$rundir"
+  # R14 (audit): keep Cerebro's own context.md out of git's view via the
+  # worktree's info/exclude, so cb-cleanup's dirty-check (git status
+  # --porcelain, which refuses the reap even under --force) does not refuse on
+  # our own artifact. Local to this disposable worktree — no shared .gitignore
+  # PR. Idempotent (grep -qxF guards a re-brief).
+  excl="$(git -C "$worktree" rev-parse --git-path info/exclude 2>/dev/null || true)"
+  if [ -n "$excl" ]; then
+    # --git-path returns a path relative to the worktree — resolve it there.
+    ( cd "$worktree" && mkdir -p "$(dirname "$excl")" \
+      && { grep -qxF "$specs_root/$slug/" "$excl" 2>/dev/null || printf '%s\n' "$specs_root/$slug/" >> "$excl"; } )
+  fi
+  {
+    printf -- '---\ntask: %s\ntype: code\njira: %s\nworktree: %s\ncreated: %s\n---\n' \
+      "$slug" "$jira" "$worktree" "$(date -Is)"
+    printf '# Objective\n\n# Context\n<!-- dispatch skill fills from the dev item (00 Inbox/%s.md) via the retrieval rule; scoped + cited -->\n\n# Scope\nIn:\nOut:\n\n# Jira\n%s\n\n# Links\n\n# Definition of done\n\n' \
+      "$slug" "${jira:-none}"
+    # brief-contract (step 8): agent-facing rules firstmate learned the hard way.
+    # §9's isolation guardrail is prose to the coordinator; the agent never sees
+    # it — so it opens the AGENT's context here (R8), plus the loop-burn cap (R11)
+    # and the shared status vocabulary (R9).
+    printf '# Agent contract (read before you branch or commit)\n'
+    printf -- '- **Worktree isolation:** run `pwd -P` and `git rev-parse --show-toplevel` FIRST — both must resolve to this disposable task worktree (`%s`). If the top-level is the primary / shared checkout (e.g. `~/code/worktrees/main`), STOP: do not branch or commit, append `blocked: launched in primary checkout`, and stop.\n' "$worktree"
+    printf -- '- **Same obstacle twice → stop:** if you hit the same obstacle a second time, append `blocked: <obstacle>` and stop rather than retrying indefinitely.\n'
+    printf -- '- **Status:** your conductor manifest is how the coordinator tracks you. Whenever you stop and wait, add a `gate:` field to its frontmatter — `needs-input` (a decision only Kyle can make), `blocked` (a hard blocker, no decision available), or `paused` (a deliberate external wait: rate-limit reset, upstream release, scheduled window) — plus `gate_since:` (an ISO timestamp, stamped ONCE when the gate opens and never refreshed while it stays open — it is how anyone tells a five-minute wait from a four-hour one), a one-line `gate_question:`, and where there are discrete answers `gate_options: ["a", "b"]`. 🔴 **`gate:` WITHOUT `gate_question:` is invalid — never write one without the other.** With no `gate_question:` the coordinator falls back to your `current_task`, so your STEP SLUG gets escalated to Kyle as though it were the question: on 2026-08-06 `autofix-eja-3983` set `gate: needs-input` during review with no question, and Kyle was handed `review/1-awaiting-reviewer` as a decision to make. Nothing can answer a step slug, so it rides every supervisor batch until a human clears it by hand. If you are stopping for a reason only you can state, state it. If you cannot phrase a question, you are not gated — you are working, so do not set `gate:` at all. **Clear them all the moment the answer arrives** — a stale `gate:` is a phantom decision on Kyle'"'"'s board. Never record a gate by editing `current_task`: that is the resume pointer, and overwriting it loses your position on resume.\n'
+    printf -- '- **Beacon, alongside the manifest:** on a deliberate external wait also append `paused: <why + when it clears>` to your status beacon, and on a hard blocker `blocked: <what you need>`. Same three words, second channel — the manifest gate drives the board, the beacon is what a reap pass reads before it decides whether your session can be stood down.\n'
+    printf -- '- **Declare the gate (`cb-ask`), do not just stop:** when you need a decision from Kyle, run `%s/cb-ask %s "<your exact question>" --options "a|b|c"`. That puts YOUR question (not the coordinator'"'"'s guess at it) on the board, so you get a specific answer back instead of a nudge to keep going.\n' "$here" "$slug"
+    printf -- '- **`cb-ask` does NOT license you to stop. Asking is not finishing.** After you ask, KEEP GOING on everything that does not depend on the answer, and commit it. Ending your turn ends your session — the harness exits and your tmux session is destroyed with it — so a turn you end while holding an open question strands that question and costs a re-adopt. **Whether your run is finished is Kyle'"'"'s call and the coordinator'"'"'s, never yours.** If genuinely nothing independent remains, say so explicitly as a hand-back ("blocked on <question>, nothing else actionable") rather than going quiet. Never announce that you are proceeding and then stop — that reads as progress and is the one thing that must not happen.\n'
+    printf -- '- **Sharpening a question you already asked? `--supersedes`.** If you re-ask because your framing got better, run `%s/cb-ask %s "<the sharper question>" --supersedes <old-key>` (cb-ask printed the key when you asked). Without it BOTH questions sit on the board and Kyle answers the same thing twice — that is exactly what happened on 2026-08-02. Writing "SUPERSEDES <key>" in the question text is the fallback, not the mechanism.\n' "$here" "$slug"
+  } | atomic_write "$rundir/context.md"
+  # task-dir meta: the classifier's kind/worktree/jira/session record, plus the
+  # computed landing path. `deliverable=` is stamped for EVERY kind even though
+  # the lander skips code (a code task's deliverable is a PR) — it costs one
+  # line, keeps one meta shape across the lanes, and is there if code landing is
+  # ever wanted.
+  td="$(cb_task_dir "$slug")"; mkdir -p "$td"
+  # Assigned, not inlined into the printf: a command substitution inside printf's
+  # argument list swallows a non-zero return and would write a blank deliverable=.
+  deliv="$(cb_deliverable_path code "$slug")"
+  printf 'kind=code\nworktree=%s\njira=%s\nsession=%s\ntarget=%s\ndeliverable=%s\n' "$worktree" "$jira" "$slug" "$target" "$deliv" | atomic_write "$td/meta"
+  echo "cb-brief: wrote $rundir/context.md"
+  exit 0
+fi
+
+# --- the research/ops tail ---------------------------------------------------
+# One scaffolder, two lanes. Frontmatter, workdir resolution and the computed
+# deliverable path are IDENTICAL for research and ops and are keyed off $mode;
+# only the agent contract in the body differs (read-only everywhere vs write
+# inside the brief's declared scope). Splitting them into two branches would
+# mean two copies of the frontmatter block — and a lost frontmatter block is the
+# whole reason `--ops` is owed: the ops lane hand-wrote its briefs, so
+# `cerebro-charter-review`, `env-error-monitor-tick` and
+# `failed-qe-triage-kyle-batch` each began at `# Objective` with no frontmatter
+# at all and became permanently unlandable.
+td="$(cb_task_dir "$slug")"; mkdir -p "$td"
+# frontmatter worktree: records the RESOLVED workdir (Evidence 11 fix; also the
+# 2026-07-13 hotfix — the old hardcoded scratch path misdirected report.md on
+# --target spawns). Same two-tier resolution cb-start applies: --target with a
+# registry checkout -> that checkout; otherwise the scratch dir. Resolution
+# failures are cb-start's to refuse loudly; the brief just records the intent.
+workdir="$CB_HOME/worktrees/$slug"
+# ...except an ops task with no --target, whose default workdir is THE VAULT
+# (cb-start:516 — vault edits + Inbox reporting). Leaving the research default
+# here would hand the agent a brief that says it is in a scratch dir cb-start
+# never put it in, and `pwd -P` disagreeing with the brief is exactly the
+# confusion the isolation self-check exists to catch.
+if [ "$mode" = ops ]; then workdir="${CB_VAULT:-$HOME/vault}"; fi
+if [ -n "$target" ]; then
+  source "$here/lib/registry.sh"
+  co="$(registry_field "$target" checkout 2>/dev/null || true)"; co="${co/#\~/$HOME}"
+  [ -n "$co" ] && workdir="$co"
+fi
+# The computed landing path (§1). Informational in the brief's frontmatter —
+# the lander reads task meta and never the report, so an agent that edits or
+# drops this field changes nothing about where its report goes. It is here so
+# the agent can SEE its own destination.
+deliv="$(cb_deliverable_path "$mode" "$slug")"
+{
+  printf -- '---\ntask: %s\ntype: %s\nclearance: standard\nstatus: running\nworktree: %s\nreport: %s\ndeliverable: %s\nbeacon: %s\nstarted: %s\n---\n' \
+    "$slug" "$mode" "$workdir" "$CB_HOME/tasks/$slug/report.md" "$deliv" "$CB_HOME/tasks/$slug/status" "$(date -Is)"
+  if [ "$mode" = ops ]; then
+  # --- ops body. Section names match the dispatch skill's O3 checklist, which is
+  # what the coordinator fills in place; `# Write scope` and `# Approved outward
+  # writes` are the two the launch prompt's guardrail actually binds against.
+  printf '# Objective\n\n# Context\n<!-- coordinator fills from the vault via the retrieval rule; scoped + cited -->\n\n# Write scope\n<!-- the exact files/areas this X-Man may create or edit; the launch prompt confines writes to this -->\n\n# Approved outward writes\nnone\n\n# Definition of done\n\n# Escalate if\n\n'
+  # `# Landing` is READ BY cb-start:539 (a sed range + a case-insensitive grep)
+  # to decide whether the agent may commit. An empty section falls through to
+  # the no-commit default, which is the right default for a scaffold — so this
+  # placeholder must not contain any of the words that grep matches, or a brief
+  # nobody has filled in would silently license a commit.
+  printf '# Landing\n<!-- coordinator fills: how the work becomes real. Empty = changes stay in the working tree for Kyle. -->\n\n'
+  printf '# Deliverable\nreport.md\n\n'
+  printf '# Agent contract\n'
+  printf -- '- **Write ONLY inside the `# Write scope` above, and write your report at EXACTLY `%s`** (the Cerebro task dir — NOT your working directory, NOT an invented slug). Anything outside that scope is off-limits, including code checkouts you happen to be sitting in; confirm where you are with `pwd -P`.\n' "$CB_HOME/tasks/$slug/report.md"
+  printf -- '- **No unapproved outward write.** Never post to Jira, Slack, Bitbucket or email, and never transition a ticket, unless `# Approved outward writes` records a SPECIFIC batch Kyle approved — then do only what is listed. On any decision this brief does not cover, append `blocked: <what you need from Kyle>` to your beacon and stop rather than guessing.\n'
+  printf -- '- **`git commit` / `git push` are governed by `# Landing`, not by your judgement.** No `# Landing` instruction means leave your changes in the working tree. Merging a PR is never yours.\n'
+  # The lander files the REPORT; the agent files nothing. Stated here as well as
+  # in cb-start's launch prompt because the brief is what a coordinator reads
+  # when it fills the sections, and an Inbox path written into `# Deliverable`
+  # is what produced two files per finding (and, now that the path is reserved,
+  # a collision refusal on every run).
+  printf -- '- **You do not choose a destination.** The `deliverable:` above is computed for you, and `cb-land` files your report there once its status is terminal. Do NOT write your own copy into `00 Inbox/` — that is two files for one finding, and it collides with the path already reserved for you. A `deliverable:` you write into your report is ignored.\n'
+  printf -- '- **Same obstacle twice → stop:** if you hit the same obstacle a second time, append `blocked: <obstacle>` to your beacon and stop rather than retrying indefinitely.\n\n'
+  else
+  printf '# Objective\n\n# Context\n<!-- coordinator fills from the vault via the retrieval rule; scoped + cited -->\n\n# Scope\nIn:\nOut:\n\n# Definition of done\n\n# Escalate if\n\n# Deliverable\nreport.md\n\n'
+  # brief-contract (step 8): the agent-facing isolation + loop-burn rules.
+  # R8 for research is the read-only form — §6.1 reuses the shared canonical
+  # checkout (~/code/worktrees/main), the one clone that can't be lost.
+  printf '# Agent contract\n'
+  printf -- '- **Read-only EVERYWHERE — the ONLY file you may write is your report, at EXACTLY `%s` (the Cerebro task dir — NOT your working directory, NOT the code checkout, NOT an invented slug).** You may be running inside a shared canonical checkout (e.g. `~/code/worktrees/main`); confirm with `pwd -P` and `git rev-parse --show-toplevel`. NEVER modify, branch, commit, or push code, and NEVER create or edit any vault file (`03 Resources/`, `02 Areas/`, `01 Projects/`, a wiki, a project overview — anywhere). If a fix or a vault landing is warranted, put the full finished content in that report.md; the write happens after you finish, never by you. **You do not choose a destination** — the `deliverable:` above is computed for you, and `cb-land` files this report there once its status is terminal.\n' "$CB_HOME/tasks/$slug/report.md"
+  printf -- '- **Same obstacle twice → stop:** if you hit the same obstacle a second time, append `blocked: <obstacle>` to your beacon and stop rather than retrying indefinitely.\n\n'
+  # Machine-applicable landing (2026-07-30). Reports that describe their landing in
+  # prose can only be applied by a human running /ingest — and that step silently
+  # did not happen (three complete reports, one a 47KB RCA, sat unlanded on
+  # 2026-07-29 while their windows were reaped). A declared block lets cb-ingest
+  # apply the ADDITIVE subset mechanically into a local commit Kyle diffs, per the
+  # eod routing-pass rubric. Prose stays welcome — it just cannot be auto-applied.
+  printf -- '- **Make your landing MACHINE-APPLICABLE where it is genuinely additive.** Still never write the vault yourself. But if your finding lands as a *new* file, an *append*, or an insert above a *unique* anchor, emit a fenced `cb-ingest` block and `cb-ingest` will apply it into a local commit Kyle reviews as a diff — instead of the finding waiting on a manual step that may never come:\n'
+  printf -- '  ```` ```cb-ingest ````\n'
+  printf -- '  `target: 03 Resources/ultron/capabilities/capability-dtcc-submission.md`\n'
+  printf -- '  `mode: insert-before`   (or `new-file` | `append`)\n'
+  printf -- '  `anchor: ## External integrations`   (insert-before only; must match EXACTLY once)\n'
+  printf -- '  `---`\n'
+  printf -- '  …then the finished content, verbatim, exactly as it should appear in the file…\n'
+  printf -- '  ```` ``` ````\n'
+  printf -- '  Header lines, a lone `---`, then content. Several blocks are fine; each is applied or refused on its own. **Only additive modes exist by design** — anything that rewrites existing prose, integrates refined-not-appended into a wiki, deletes, or needs a judgment call between two destinations must stay prose for `/ingest`. Never target `CLAUDE.md`, `profile.md`, `personality.md`, `hot.md`, `board.md`, `People/`, `Confidential/`, `.claude/` or `scripts/` — those are refused and the refusal is logged.\n\n'
+  fi
+  # Shared tail — the declared-gate verbs and the beacon contract are the same
+  # contract in both lanes, so they are written once rather than copied into the
+  # ops branch where the copy would drift.
+  printf -- '- **Declare the gate (`cb-ask`), do not just stop:** when you need a decision from Kyle, run `%s/cb-ask %s "<your exact question>" --options "a|b|c"`. That puts YOUR question (not a guess derived from your beacon) on the board, so you get a specific answer back instead of a nudge to keep going.\n' "$here" "$slug"
+  printf -- '- **`cb-ask` does NOT license you to stop. Asking is not finishing.** After you ask, keep going on everything that does not depend on the answer. **Whether your run is finished is Kyle'"'"'s call and the coordinator'"'"'s, never yours.** If nothing independent remains, say so explicitly as a hand-back rather than going quiet — and never announce that you are proceeding and then stop.\n'
+  printf -- '- **Sharpening a question you already asked? `--supersedes`.** If you re-ask because your framing got better, run `%s/cb-ask %s "<the sharper question>" --supersedes <old-key>` (cb-ask printed the key when you asked). Without it BOTH questions sit on the board and Kyle answers the same thing twice — that is exactly what happened on 2026-08-02. Writing "SUPERSEDES <key>" in the question text is the fallback, not the mechanism.\n' "$here" "$slug"
+  # R9 — the sparse status-beacon contract (stall detection depends on it).
+  # Sparse, material-changes-only: the watcher reads the pane for step-by-step;
+  # each append is a phase signal, and its mtime is the staleness clock.
+  printf '# Status beacon\n'
+  printf 'Append ONE line to your beacon file (`%s`) on each MATERIAL phase change — not step-by-step FYI. Format `{state}: {one line}`, state one of `running` / `paused` / `blocked`:\n' "$CB_HOME/tasks/$slug/status"
+  printf -- '- `running: <what phase you just entered>` — normal progress.\n'
+  printf -- '- `paused: <why + when it clears>` — a deliberate wait on a known external clear (rate-limit reset, upstream release, scheduled window); the watcher then leaves you alone and rechecks on a long cadence instead of treating the idle as a wedge.\n'
+  printf -- '- `blocked: <what you need>` — stuck and needing a decision or unblock.\n'
+  printf 'Silence past the stall threshold with no fresh line reads as a stall and surfaces. Keep it sparse; report.md is still your terminal deliverable.\n'
+} | atomic_write "$td/brief.md"
+# Research/ops meta. The research lane wrote NO meta at all before this —
+# neither here nor in cb-start --research — and classify() routes anything that
+# is not kind=code to classify_research (lib/classify.sh:977), so kind=research
+# is a no-op for every existing reader while giving the lander a deliverable=
+# to file against. Written after brief.md so a failed brief write leaves no
+# half-scaffolded task.
+#
+# For ops this file is written FIRST and cb-start rewrites it at spawn time (the
+# ops lane is brief-then-start), so the shape here has to be the one cb-start:582
+# knows how to carry across: it preserves `deliverable=` and re-derives the rest.
+# Same shape cb-distill:172 writes for its own ops task — two scaffolders, one
+# meta shape, deliberately.
+printf 'kind=%s\nsession=%s\ndeliverable=%s\n' "$mode" "$slug" "$deliv" | atomic_write "$td/meta"
+echo "cb-brief: wrote $td/brief.md"

@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# has-session -t <slug> : exit 0 iff $CB_HOME/alive/<slug> exists
+[ "$1" = "has-session" ] && { [ -f "$CB_HOME/alive/${3}" ]; exit $?; }
+[ "$1" = "capture-pane" ] && { cat "$CB_HOME/pane/${3:-x}" 2>/dev/null; exit 0; }
+exit 0

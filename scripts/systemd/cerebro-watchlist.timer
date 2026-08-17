@@ -1,0 +1,14 @@
+# cerebro-watchlist.timer — hourly firing for the watch-list oneshot. The hourly
+# tick renders (cheap, idempotent) and polls only signals whose per-signal
+# poll_interval (3h / 6h in watchlist.md) has elapsed — so the actual poll cadence
+# is the config's, not this timer's.
+[Unit]
+Description=Cerebro watch-list schedule (hourly tick)
+
+[Timer]
+OnBootSec=360
+OnCalendar=*:17:00
+AccuracySec=60
+
+[Install]
+WantedBy=timers.target

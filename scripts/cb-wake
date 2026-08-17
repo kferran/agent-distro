@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# scripts/cerebro/cb-wake — R4 wake-queue CLI.
+#
+#   cb-wake --drain   consume + print unacknowledged escalations (the drain IS
+#                     the acknowledgement). Run at coordinator-session start and
+#                     on every recovery turn — cb-ensure-session invokes it
+#                     alongside cb-adopt when it recreates the session.
+#   cb-wake --peek    show the queue WITHOUT consuming it (for the board).
+#
+# Deliberately its own script rather than a flag on cb-adopt: cb-adopt's
+# contract is "report reconcile state (dry, never mutates)" and a drain moves
+# state. Two different promises, two different commands.
+set -euo pipefail
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$here/lib/paths.sh"; source "$here/lib/wake.sh"
+
+case "${1:-}" in
+  --drain)
+    staged="$(cb_wake_stage)" || exit 0          # nothing queued is the normal case
+    # Restore on ANY failure to emit: paging twice beats losing the wake, which
+    # is the whole reason this queue exists.
+    trap 'cb_wake_restore "$staged"' EXIT
+    cb_wake_format "$staged"
+    trap - EXIT
+    rm -f "$staged"
+    ;;
+  --peek)
+    [ -s "$CB_WAKE_QUEUE" ] || exit 0
+    cb_wake_format "$CB_WAKE_QUEUE"
+    ;;
+  *) echo "usage: cb-wake --drain | --peek" >&2; exit 2;;
+esac

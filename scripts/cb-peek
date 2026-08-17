@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# scripts/cerebro/cb-peek <slug> [lines]
+# Target resolves from the task meta: research tasks are windows in the "cb"
+# session (cb:<slug>); code tasks are per-slug sessions (<slug>:, ratified
+# 2026-07-12).
+set -euo pipefail
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"; source "$here/lib/paths.sh"
+# R1 (firstmate fm-guard): the who-watches-the-watcher check rides every command
+# the coordinator already runs — no cron, no hook. Warns only (events + the
+# coordinator session + push), never blocks; self-delivers so its stdout is nil.
+"${CB_GUARD_CMD:-$here/cb-guard}" >/dev/null 2>&1 || true
+tmux="${CB_TMUX_BIN:-tmux}"; slug="$1"; lines="${2:-40}"
+if grep -q '^kind=code$' "$(cb_task_dir "$slug")/meta" 2>/dev/null; then
+  target="$slug:"
+else
+  target="cb:$slug"
+fi
+"$tmux" capture-pane -p -t "$target" | tail -n "$lines"

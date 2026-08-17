@@ -1,0 +1,11 @@
+● Read .ai/specs/fix-x/context.md (58 lines)
+
+● I'll drive this with the work-conductor skill. Spawning the investigate pass.
+
+  ✻ Waiting for 1 background agent to finish
+
+────────────────────────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────────────────────────
+  vault  |  cerebro/fix-x  |  [░░░░░░░░░░] 12%  |  Opus 5
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents

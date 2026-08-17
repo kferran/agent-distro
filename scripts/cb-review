@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# scripts/cerebro/cb-review <slug> — read-only convenience: the task branch's
+# diff against its base (stat + patch bounded at CB_REVIEW_MAX_LINES, default
+# 400) for the operator/board. Never writes anything.
+set -euo pipefail
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$here/lib/paths.sh"; source "$here/lib/registry.sh"; source "$here/lib/classify.sh"
+: "${CB_REVIEW_MAX_LINES:=400}"
+
+slug="${1:-}"; [ -n "$slug" ] || { echo "usage: cb-review <slug>" >&2; exit 2; }
+# R1 (firstmate fm-guard): who-watches-the-watcher rides every command the
+# coordinator runs — warns only (events + coordinator session + push), never blocks.
+"${CB_GUARD_CMD:-$here/cb-guard}" >/dev/null 2>&1 || true
+td="$(cb_task_dir "$slug")"
+[ "$(_meta_field "$td" kind)" = "code" ] || { echo "cb-review: $slug is not a code task" >&2; exit 1; }
+wt="$(_meta_field "$td" worktree)"
+target="$(_meta_field "$td" target)"
+base="$(registry_field "$target" base)"; : "${base:=main}"
+
+_git() { if [ -n "${CB_GIT_CMD:-}" ]; then eval "$CB_GIT_CMD" '"$@"'; else git "$@"; fi; }
+
+_git -C "$wt" diff "origin/$base...HEAD" --stat
+echo
+patch="$(_git -C "$wt" diff "origin/$base...HEAD")"
+total="$(printf '%s\n' "$patch" | wc -l)"
+printf '%s\n' "$patch" | head -n "$CB_REVIEW_MAX_LINES"
+if [ "$total" -gt "$CB_REVIEW_MAX_LINES" ]; then
+  echo "… truncated ($total lines total, showing $CB_REVIEW_MAX_LINES — raise CB_REVIEW_MAX_LINES or read the worktree)"
+fi

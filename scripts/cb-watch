@@ -1,0 +1,287 @@
+#!/usr/bin/env bash
+# scripts/cerebro/cb-watch [--tick|--loop]
+set -euo pipefail
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"; source "$here/lib/paths.sh"; source "$here/lib/classify.sh"; source "$here/lib/coordinator.sh"
+tick() {
+  local td slug now gate hash prev tag seen dk dstate dgate r20run r20mark
+  mkdir -p "$CB_HOME/logs" "$CB_HOME/beacons"
+  # heartbeat for cb-guard's watcher-down check — events move only on state
+  # changes, so guard needs a per-tick signal, not the events mtime
+  touch "$CB_HOME/beacons/watch.heartbeat"
+  for td in "$CB_HOME"/tasks/*/; do
+    [ -d "$td" ] || continue; slug="$(basename "$td")"
+    # merge detection stays zero-token bash: poll every code task with an
+    # OPEN pr file before classifying, so the merge tick classifies done.
+    # A poll failure (network flake, dead token — cb-merge logs the escalate
+    # itself) must never kill the watcher.
+    if [ -f "$td/pr" ] && [ "$(cat "$td/pr.state" 2>/dev/null)" = "OPEN" ]; then
+      "$here/cb-merge" --poll "$slug" >/dev/null 2>&1 || true
+    fi
+    # R20 (2026-08-01): the ready-no-PR arm, moved here from cb-magneto. Until
+    # now cb-pr-check's ONLY caller was cb-magneto's sweep, and that sweep has
+    # never completed a single time (its `magneto.md` was never written), so a
+    # conductor that finished its ship phase but never had a PR opened just sat
+    # there. That is the code loop the 07-13 audit ranked step 0. cb-magneto is
+    # deleted in the same change; this is the one function of it that was not
+    # already duplicated by cb-reap --sweep / cb-digest.
+    #
+    # Conditions, cheap-first: a code task, no `pr` file, no summary.md (written
+    # only after a successful create, so its absence means no PR yet), and a
+    # resolvable run dir holding 04-ship.md. cb-pr-check re-checks all of these
+    # itself and is idempotent — this is a prefilter, not the gate.
+    #
+    # Deliberately BROADER than magneto's version, which also required
+    # `ls-remote --heads origin fe/$slug` and so silently skipped every wc-*
+    # branch. cb-pr-check:59 does the pushed-branch check properly, against the
+    # branch parsed out of 04-ship.md, so the arm never has to guess the name.
+    #
+    # Hardcoded rather than R21's per-task check.sh hook: that hook does not
+    # exist anywhere under scripts/ or .claude/skills/, and three weeks of "do
+    # it structurally" produced nothing, so an arm that runs wins.
+    #
+    # `|| true` for the same reason as the cb-merge poll above — a failed create
+    # must never kill the watcher. It retries next tick, which is intended: a
+    # conductor that shipped and never pushed should keep saying so. But the
+    # FIRST failure logs one event, create-if-absent (R18's content-keyed dedup,
+    # applied per slug) — without it, "the arm never fired" and "the arm fires
+    # and fails every 30s" look identical from the outside, which is exactly the
+    # Type-B defect this arm exists to close. One line, not 584 of them.
+    if [ ! -f "$td/pr" ] && [ ! -f "$td/summary.md" ] \
+       && [ "$(_meta_field "$td" kind)" = "code" ]; then
+      if r20run="$(resolve_run "$(_meta_field "$td" worktree)" "$slug" "$(_meta_field "$td" jira)" 2>/dev/null)" \
+         && [ -f "$r20run/04-ship.md" ]; then
+        if ! ${CB_PRCHECK_CMD:-$here/cb-pr-check} "$slug" >/dev/null 2>&1; then
+          r20mark="$CB_HOME/beacons/$slug.prcheck-failed"
+          if [ ! -e "$r20mark" ]; then
+            printf '%s %s pr-check-failed (04-ship.md present, no PR opened)\n' \
+              "$(date -Is)" "$slug" >> "$CB_HOME/logs/events"
+            : > "$r20mark"
+          fi
+        fi
+      fi
+    fi
+    now="$(classify "$td")"
+    gate="$(task_gate "$td")"
+    # LANDING (2026-08-14): a finished research/ops report files ITSELF into the
+    # vault, at the destination cb-brief computed for it at scaffold time. Until
+    # now a finding reached the vault only when a human remembered to run
+    # /ingest, and that step silently didn't happen — cb-unlanded's register
+    # carries 90+ reports whose findings never landed, some surfaced 140+ times.
+    #
+    # WHY HERE AND NOT ON THE FLEET TICK. One job, one scheduler. An hourly tick
+    # arm would race this one over the same task dir and double-commit, which is
+    # the duplicate-scheduler pattern the scheduled-tasks-log opens with. The
+    # watcher is already the component whose whole job is noticing state: it is
+    # a systemd service with Restart=always, it ticks every ~30s, and it is
+    # where cb-reap and the R20 arm were moved for exactly that reason.
+    #
+    # Conditions, cheap-first (same shape as R20 above): a terminal state we
+    # already computed, no `landed` marker, not the code lane, and a report
+    # actually on disk. cb-land re-checks every one of these itself — plus the
+    # clearance gate, the collision test and the destination denylist — and is
+    # idempotent, so this is a prefilter, not the gate.
+    #
+    # DELIBERATELY NOT ALSO GATED ON `surfaced`, though it would save a fork on
+    # every already-refused task. cb-land clears that marker only on the LANDING
+    # path (cb-land:221), which a refused task never reaches — so gating on it
+    # here means a refusal never gets re-evaluated: a `confidential` clearance
+    # later corrected to `standard`, or a collision cleared by hand, would sit
+    # refused until someone ran `cb-land --drain`, and cb-land's changed-reason
+    # branch (cb-land:88) would be dead code under the watcher. A refusal is
+    # permanent by CONSTRUCTION, not by fact, and the fact can change. The repeat
+    # is already cheap and silent by design — a few stats and no write — so the
+    # fork is the smaller cost, and recovery stays automatic.
+    #
+    # `|| true` for the same reason as the cb-merge poll and the R20 arm — a
+    # failed landing must never kill the watcher; it retries next tick. `done`
+    # is listed for completeness: only classify_code returns it, and the code
+    # lane is excluded below, so a task reaching here is `ready-for-review`.
+    #
+    # But `|| true` ALONE is a Type-B defect, which is what the R20 arm's
+    # first-failure record above exists to prevent and why this one mirrors it
+    # exactly: with the failure swallowed, "the arm never fired" and "the arm
+    # fires and fails every 30s" look identical from the outside. C4 (a missing
+    # `00 Inbox/` aborting a whole --drain) was precisely such a failure and
+    # would have been invisible in production for this reason. One event line,
+    # create-if-absent per slug — a per-tick line would be ~2,880 a day and bury
+    # the log, and the retry itself is the thing that must not be suppressed.
+    case "$now" in
+      ready-for-review|done)
+        if [ ! -e "$td/landed" ] \
+           && [ "$(_meta_field "$td" kind)" != "code" ] \
+           && [ -f "$td/report.md" ]; then
+          if ! ${CB_LAND_CMD:-$here/cb-land} "$slug" >/dev/null 2>&1; then
+            landmark="$CB_HOME/beacons/$slug.land-failed"
+            if [ ! -e "$landmark" ]; then
+              mkdir -p "$CB_HOME/beacons" "$CB_HOME/logs"
+              printf '%s %s land-failed (terminal report, cb-land refused or errored)\n' \
+                "$(date -Is)" "$slug" >> "$CB_HOME/logs/events"
+              : > "$landmark"
+            fi
+          fi
+        fi ;;
+    esac
+    # R12: watcher-DERIVED open — a needs-input/blocked task opens a content-keyed
+    # decision (idempotent; no agent-contract change). The decision gate is the
+    # code manifest gate (task_gate) or, for research, the beacon descriptor. The
+    # open-decision SET (not last-state) is what the board surfaces, so a later
+    # terminal flip can't silently mask a still-open decision (§5 anti-masking).
+    case "$now" in
+      needs-input|blocked)
+        # P1 reconciliation — BOTH escalation paths stay, but a task surfaces
+        # ONCE. A cb-ask'd (declared) decision keys on the worker's question
+        # text; the watcher's derived key is the manifest gate / beacon
+        # descriptor — different keys, so opening both would put the same task on
+        # the board twice (one hi-fi, one heuristic). The declared one is
+        # strictly better information, so: do not open a heuristic key while a
+        # declared one is live, and resolve any heuristic key already open for
+        # this task (append-only supersession, not a rewrite). With no declared
+        # decision this is exactly the old behavior — the fail-safe net for a
+        # worker that never asked.
+        if _has_declared_open "$td"; then
+          while read -r dk; do
+            [ -n "$dk" ] && _decision_resolve "$td" "$dk"
+          done < <(_open_heuristic_keys "$td")
+        else
+          # An EMPTY key is _decision_for declining to project: a code task with
+          # no `gate:`/`gate_question:` in its manifest has not declared a
+          # question, and `current_task` is a resume pointer, not one. The state
+          # still reaches the board (cb-board's needs-input line) and the events
+          # log still records it — what it does not do is mint a decision keyed
+          # on text that will never change, which nothing could then close.
+          IFS=$'\t' read -r dk dstate dgate <<<"$(_decision_for "$td" "$now")"
+          if [ -n "$dk" ]; then _decision_open "$td" "$dk" "$dstate" "$dgate"; fi
+        fi ;;
+      running)
+        # R12 progress-inferred CLOSE: back to a WORKING state = the gate cleared
+        # and work resumed → resolve the HEURISTIC decision(s). classify only
+        # returns `running` on genuine freshness (a fresh research beacon / a
+        # fresh non-gate manifest), so this IS post-decision progress. A terminal
+        # flip (done/ready-for-review/failed) or a `paused` never reaches here,
+        # so it never closes an open decision — the anti-masking guarantee (§5).
+        #
+        # HEURISTIC ONLY — never a DECLARED key (2026-07-30). Progress is
+        # evidence that a *watcher-derived guess* has cleared; it is NOT an
+        # answer to a question a worker actually asked. cb-ask is explicitly an
+        # ask-and-continue channel ("this doesn't block items 1-3, proceeding"),
+        # and for a CODE task `classify_code` never reads the beacon — so
+        # cb-ask's `paused:` line cannot hold the state and the task keeps
+        # classifying `running`. Resolving everything here closed real questions
+        # 11s and 32s after they were asked (eja-3963, 2026-07-30): both were
+        # gone from the board before any human saw them. A declared key is now
+        # only ever closed by an actual answer, or by the worker re-declaring.
+        while read -r dk; do
+          [ -n "$dk" ] && _decision_resolve "$td" "$dk"
+        done < <(_open_heuristic_keys "$td") ;;
+      needs-relaunch)
+        # M6: exhausted wedge escalated to a human-action state. Resolve any
+        # superseded open decision(s) (single-surface — the needs-relaunch page +
+        # board bucket supersede the blocked decision; a louder escalation, not an
+        # anti-masking violation). Paging happens below, after the eventhash
+        # beacon is written for this tick (cb-notify needs it to exist).
+        while IFS=$'\t' read -r dk _; do
+          [ -n "$dk" ] && _decision_resolve "$td" "$dk"
+        done < <(open_decisions "$td") ;;
+    esac
+    # escalation dedup keyed on (slug, state, current_task) — a conductor that
+    # pauses at build then later at review emits two events; the same gate
+    # twice emits one (spec §7). Dedup hash per slug; state beacon kept too.
+    hash="$(printf '%s|%s' "$now" "$gate" | sha1sum | cut -d' ' -f1)"
+    prev="$(cat "$CB_HOME/beacons/$slug.eventhash" 2>/dev/null || echo none)"
+    if [ "$hash" != "$prev" ]; then
+      # R18 (step 12): content-keyed dedup, NOT a time window. A per-slug seen-set
+      # (create-if-absent) records every content hash; a hash already seen never
+      # re-logs — no matter how long ago — while a genuinely new (state,gate)
+      # logs once. This replaces CB_FLAP_COOLDOWN_SECS: a running↔needs-input flap
+      # reproduces a seen hash → suppressed at the root, hash-immune to elapsed
+      # time. (The send path's own dedup — cb-notify's .notified — is likewise
+      # content-keyed; blocked-exhausted keeps its intentional per-episode page.)
+      seen="$CB_HOME/beacons/$slug.seenhashes"
+      if grep -qxF "$hash" "$seen" 2>/dev/null; then
+        : # already surfaced this exact (state,gate) — suppressed
+      else
+        tag=""
+        [ "$now" = "failed" ] && [ -f "$td/oom-detected" ] && tag=" (oom)"
+        printf '%s %s %s%s%s\n' "$(date -Is)" "$slug" "$now" "${gate:+ ($gate)}" "$tag" >> "$CB_HOME/logs/events"
+        printf '%s\n' "$hash" >> "$seen"
+      fi
+      printf '%s' "$hash" | atomic_write "$CB_HOME/beacons/$slug.eventhash"
+      printf '%s' "$now" | atomic_write "$CB_HOME/beacons/$slug.state"
+    fi
+    # blocked gets a remediation attempt every tick — cb-remediate's own
+    # verify-probe/episode-marker/cap decide whether anything happens (a
+    # cap-exhausted wedge still pages immediately via cb-notify blocked-exhausted).
+    if [ "$now" = "blocked" ]; then
+      "$here/cb-remediate" "$slug" >/dev/null || true
+    fi
+    # needs-relaunch: cb-remediate is NEVER called (the trigger above is
+    # `now = blocked` only) — a human must relaunch. Page once via cb-notify
+    # (content-deduped, mirrors blocked-exhausted).
+    if [ "$now" = "needs-relaunch" ]; then
+      "$here/cb-notify" "$slug" needs-relaunch "$gate" || true
+    fi
+    # (needs-input is no longer paged per-task — R15 coalesces the whole
+    # open-decision set into one digest below.)
+  done
+  # R19 auto-exit: if focus is on and Kyle has returned (a non-marker turn in the
+  # coordinator pane), exit focus and request a catch-up flush of the held set.
+  if [ "$(cat "$CB_HOME/mode" 2>/dev/null)" = "focus" ] && cb_focus_human_returned; then
+    printf 'catch-up' | atomic_write "$CB_HOME/mode"
+  fi
+  # R15: one coalesced pre-read digest of the open-decision set, flushed on the
+  # oldest-item batch window (replaces the per-task needs-input page). A digest
+  # failure never kills the tick.
+  "$here/cb-digest" >/dev/null 2>&1 || true
+  # cb-board is a separate process — it re-sources paths.sh and reads CB_VAULT
+  # itself. In practice CB_HOME/CB_VAULT always arrive here already exported
+  # (env / systemd Environment= / inline VAR=x cmd), so the child inherits
+  # them regardless of this line.
+  # defensive: guarantee the cb-board child sees the same paths even if
+  # these ever arrive as non-exported shell vars.
+  export CB_HOME CB_VAULT
+  "$here/cb-board" >/dev/null
+}
+case "${1:---loop}" in
+  --tick) tick;;
+  --loop)
+    # Singleton guard (audit finding #2): refuse a second concurrent --loop.
+    # Two loops race cb-remediate's unlocked remediation-count and can
+    # double-resume a wedge. flock auto-releases on process death, so there is
+    # no stale-PID file to clean up — which is why the old cb-lock helper (a
+    # $$-in-a-file lock with zero callers) was deleted rather than fixed. Locks
+    # the --loop daemon only; --tick is a single pass and needs no lock.
+    lock="$CB_HOME/locks/cb-watch.lock"; mkdir -p "$(dirname "$lock")"
+    exec {CB_LOCK_FD}>"$lock"
+    if ! flock -n "$CB_LOCK_FD"; then
+      echo "cb-watch: another --loop already holds $lock — refusing to start a second watcher" >&2
+      exit 1
+    fi
+    # ~30s default (audit finding #3): the tick quantizes cb-notify's 90s grace,
+    # so 120 pushed a needs-input page to 2-4 min. A tick costs a few stats +
+    # one tmux list (zero coordinator turns), so fast ticks are near-free.
+    # REAP RIDES THE WATCHER, NOT ONLY THE HOURLY INTAKE (2026-07-30).
+    # cb-reap used to be invoked from exactly one place: `cb-intake --tick`
+    # (cb-intake:23). So slot reclamation inherited intake's cadence AND its
+    # availability — and when the intake path was paused on 2026-07-29, reaping
+    # stopped with it while finished agents held every slot. The watcher is the
+    # right owner: it is a systemd service with Restart=always, it already ticks
+    # every ~30s, and it is the component whose whole job is noticing state.
+    # Not every tick — cb-reap does a git rev-list per worktree, so it runs on a
+    # slower sub-cadence (default every 10 ticks ≈ 5 min, vs hourly before).
+    # Isolated with `|| true`: a reap failure must never kill the watcher, same
+    # discipline as the cb-merge --poll call in tick().
+    reap_every="${CB_REAP_EVERY_TICKS:-10}"
+    reap_n=0
+    while true; do
+      tick
+      if [ "${CB_WATCH_REAP:-1}" = 1 ]; then
+        reap_n=$(( reap_n + 1 ))
+        if [ "$reap_n" -ge "$reap_every" ]; then
+          reap_n=0
+          "$here/cb-reap" --sweep >/dev/null 2>&1 || true
+        fi
+      fi
+      sleep "${CB_TICK_SECS:-30}"
+    done
+    ;;
+esac

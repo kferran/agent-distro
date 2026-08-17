@@ -1,0 +1,11 @@
+# cerebro-intake.timer — hourly firing for the intake oneshot.
+[Unit]
+Description=Cerebro intake schedule (hourly)
+
+[Timer]
+OnBootSec=300
+OnCalendar=hourly
+AccuracySec=60
+
+[Install]
+WantedBy=timers.target

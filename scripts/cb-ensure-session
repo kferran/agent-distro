@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+# cb-ensure-session — idempotent ensure of the always-on Cerebro coordinator
+# tmux session. Run by the cerebro.timer systemd --user unit (oneshot, every
+# ~2 min + at boot): if the session is alive, exit 0; if not, recreate it.
+# Self-healing without PID tracking — the right shape for a shared tmux
+# server, where `tmux new-session -d` just messages the existing server and
+# gives systemd nothing to track (Type=forking would restart-loop).
+set -euo pipefail
+SESSION="${CB_SESSION:-Cerebro}"
+VAULT="${CB_VAULT:-$HOME/vault}"
+CLAUDE_BIN="${CB_CLAUDE_BIN:-$HOME/.local/bin/claude}"
+TMUX_BIN="${CB_TMUX_BIN:-/usr/bin/tmux}"
+
+"$TMUX_BIN" has-session -t "$SESSION" 2>/dev/null && exit 0
+
+# Recreate: reconcile state first (cb-adopt reports active/stale/orphaned) and
+# show the R4 wake queue, then hand the pane to the coordinator claude. When
+# claude exits/crashes, the pane dies -> session ends -> the timer recreates it
+# within ~2 min.
+#
+# NOTE the `--peek`, and do not "upgrade" it to `--drain`. Everything on this
+# line runs in the pane's init shell, BEFORE `exec claude` — its output is
+# terminal scrollback that the coordinator model never sees. `--drain` consumes
+# the queue, so draining here would delete every unacknowledged wake into a void
+# on each restart: R4 defeating R4. It is the same distinction the enqueue side
+# already makes — a successful write is not a read. `--peek` is non-destructive,
+# so it costs nothing here and is there for Kyle if he looks at the pane.
+#
+# The CONSUMING drain belongs to the coordinator agent's own turn, where the
+# output lands in its context: .claude/skills/board/SKILL.md step 1.
+"$TMUX_BIN" new-session -d -s "$SESSION" -c "$VAULT" \
+  "$VAULT/scripts/cerebro/cb-adopt; $VAULT/scripts/cerebro/cb-wake --peek; exec $CLAUDE_BIN"
+echo "cb-ensure-session: created $SESSION"

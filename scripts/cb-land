@@ -1,0 +1,334 @@
+#!/usr/bin/env bash
+# cb-land [--drain | <slug>] [--dry-run] — file a finished research/ops report
+# into the vault at the destination that was computed for it at scaffold time.
+#
+# WHY THIS EXISTS. A research/ops X-Man is read-only on the vault, so its
+# finding reached the vault only when a human remembered to run /ingest. That
+# step silently didn't happen: cb-unlanded's register carries 90+ reports whose
+# findings never landed, some surfaced 140+ times. cb-ingest closed a narrower
+# hole (a report that DECLARES a machine-applicable block — measured 0 of 138 on
+# 2026-07-31), so the common case still had no mechanism at all.
+#
+# WHY IT IS ALLOWED TO WRITE, given /ingest reserves destinations for Kyle. It
+# does not CHOOSE a destination. `lib/land.sh` computes one from facts the
+# scripts already hold — local date, kind, slug — and `cb-brief` stamps it into
+# task meta before the agent ever runs. There is no judgment left in the write:
+# the file goes to `00 Inbox/`, which is the untriaged-capture folder, and the
+# judgment (what the finding MEANS, where its prose belongs) stays with /ingest
+# and with the distiller. Landing a report is filing, not routing.
+#
+# WHAT IT WILL NOT DO. It never overwrites an existing file (an existing page at
+# the computed path may already have been distilled or hand-edited), never lands
+# a `clearance: confidential` report, never writes outside `00 Inbox/`, never
+# `git add -A` — an `add -A` would swallow ns-capability-drift's deliberately
+# staged-uncommitted doc edits and vault-routing's own local commits, and would
+# make "revert one SHA" false — and never pushes.
+set -euo pipefail
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$here/lib/paths.sh"
+source "$here/lib/land.sh"
+source "$here/lib/unlanded.sh"     # ul_report_field / ul_clearance / ul_register_clear
+source "$here/lib/classify.sh"     # cb_window_alive / cb_session_present
+
+CB_HOME="${CB_HOME:-$HOME/.cerebro}"
+# Same resolution as cb-ingest:44 — VAULT_DIR is how every vault-writing script
+# is redirected in tests, and a divergent variable here would leave cb-land the
+# one script a test could not point away from the real vault.
+VAULT="${VAULT_DIR:-$HOME/vault}"
+LOCAL="$(cb_local_date)"
+REGISTER="$CB_HOME/logs/unlanded-register"
+SURFACED="$CB_HOME/logs/land-surfaced"
+# Repo-relative form kept deliberately, even though nothing stages it any more
+# (C1, see surface()) — it is the name this file goes by in every other pass
+# that appends to it, and in ingest/SKILL.md trigger 3.
+RATIFY_REL="00 Inbox/$LOCAL-vault-maintenance-ratify.md"
+RATIFY="$VAULT/$RATIFY_REL"
+LOCKDIR="$CB_HOME/locks"
+
+mode=""; one_slug=""; dry=""
+while [ $# -gt 0 ]; do case "$1" in
+  --drain)   mode=drain; shift;;
+  --dry-run) dry=1; shift;;
+  -*) echo "cb-land: unknown arg $1" >&2; exit 2;;
+  *)  [ -z "$one_slug" ] || { echo "cb-land: one slug at a time (or --drain)" >&2; exit 2; }
+      mode=one; one_slug="$1"; shift;;
+esac; done
+[ -n "$mode" ] || { echo "usage: cb-land {--drain|<slug>} [--dry-run]" >&2; exit 2; }
+[ "$mode" = one ] && { cb_require_slug "$one_slug" || exit 2; }
+
+# Refuse early, before anything is written or any directory is created.
+# cb-watch.bats overrides HOME to a throwaway dir so no test can touch the real
+# vault, and its terminal-report fixtures reach the wave-3 landing arm. Without
+# this the lander would helpfully materialise a whole vault tree under a bats
+# tmpdir — and, worse, would do the same on any machine where the vault is not
+# checked out, silently building a shadow copy nobody reads.
+[ -d "$VAULT" ] || { echo "cb-land: no vault at '$VAULT' — nothing to do" >&2; exit 1; }
+
+mkdir -p "$CB_HOME/logs" "$LOCKDIR"
+
+landed=0; surfaced=0; resurfaced=0; skipped=0
+declare -a LANDED_PATHS=()
+ratify_touched=0
+
+# surface SLUG REASON — the two places a refusal has to appear. The log is for
+# the fleet (cheap, greppable, never rotated); the ratify worklist is for Kyle,
+# because a refusal nobody reads is the same as a dropped report and that is the
+# failure this whole mechanism exists to remove.
+#
+# THE WORKLIST IS APPENDED TO AND NEVER COMMITTED (C1, review cycle 1). It is a
+# SHARED append surface — vault-routing, cb-ingest, the housekeeping audits and
+# /eod all write to it, and it carries undecided lines all day — so staging it
+# wholesale sweeps other passes' pending decisions into a `land:` commit. That
+# is the `git add -A` failure by a narrower route, and the flock does not help:
+# nothing outside cb-land and cb-distill takes that lock. Reproduced twice, with
+# a `- [ ] PENDING ROUTING DECISION from vault-routing` line committed under
+# `land: … 0 landed, 1 surfaced`. The append is a notification, not a landing:
+# the file persists on disk and /eod's daily commit picks it up like every other
+# ratify append.
+#
+# SURFACE ONCE PER REASON, not once per tick. cb-watch runs this every ~30s, and
+# a refusal is permanent by construction — a `confidential` report stays
+# confidential, a collision stays collided — so an unguarded surface would
+# append the same bullet to the ratify worklist ~2,900 times a day and make a
+# `land:` commit for each one, burying the morning diff. Same defect and same
+# reasoning as cb-unlanded's fingerprint-on-change guard: a notification that
+# repeats unchanged is how the prose sweep got ignored. The marker holds the
+# REASON, so a task whose refusal changes (clearance edited, collision cleared
+# then re-created) surfaces again with the new one.
+surface() {
+  local slug="$1" reason="$2" marker prior
+  marker="$(cb_task_dir "$slug")/surfaced"
+  prior="$(cat "$marker" 2>/dev/null || true)"
+  if [ "$prior" = "$reason" ]; then
+    resurfaced=$(( resurfaced + 1 ))
+    printf '  . unchanged (already surfaced): %s — %s\n' "$slug" "$reason"
+    return 0
+  fi
+  surfaced=$(( surfaced + 1 ))
+  printf '  ! surfaced: %s — %s\n' "$slug" "$reason"
+  [ -n "$dry" ] && return 0
+  printf '%s\n' "$reason" | atomic_write "$marker"
+  printf '%s\t%s\t%s\n' "$(date -Is)" "$slug" "$reason" >> "$SURFACED"
+  if [ "$ratify_touched" -eq 0 ]; then
+    # C4: `>>` cannot create a missing directory, and under `set -euo pipefail`
+    # the redirect failure kills the whole process — taking every task after
+    # this one with it, silently (C3). land_one promises the opposite at :109.
+    mkdir -p "$(dirname "$RATIFY")"
+    {
+      printf '\n## cb-land — surfaced, not filed\n\n'
+      printf 'Terminal reports the lander refused to file automatically (%s). Each is\n' "$(TZ=America/Denver date +%FT%H:%M)"
+      printf 'still in its task dir; none was written into the vault, none was dropped.\n\n'
+    } >> "$RATIFY"
+    ratify_touched=1
+  fi
+  printf -- '- `%s` — %s\n' "$slug" "$reason" >> "$RATIFY"
+}
+
+# land_one SLUG — the per-slug algorithm. Never exits; every outcome is a
+# counted line, so one bad task cannot abort a --drain.
+land_one() {
+  local slug="$1"
+  local td rep kind cl st dest src at prior recomputed=""
+
+  td="$(cb_task_dir "$slug")"
+  [ -d "$td" ] || { printf '  - skipped: %s (no task dir)\n' "$slug"; skipped=$(( skipped + 1 )); return 0; }
+
+  # 1. kind. `grep || true`: a missing meta is not an error here — the research
+  # lane wrote no meta at all before wave 1, and those tasks still deserve to
+  # land. Absent kind reads as research for the same reason classify() does:
+  # anything that is not kind=code routes to classify_research.
+  kind="$(grep -m1 '^kind=' "$td/meta" 2>/dev/null | cut -d= -f2- || true)"
+  kind="${kind:-research}"
+  if [ "$kind" = code ]; then
+    printf '  - skipped: %s (not a landing lane — deliverable is a PR)\n' "$slug"
+    skipped=$(( skipped + 1 )); return 0
+  fi
+
+  # 2. the report. Research/ops write it into the task dir; the code lane's
+  # worktree report is not our business (see above).
+  rep="$td/report.md"
+  [ -f "$rep" ] || { printf '  - skipped: %s (no report.md)\n' "$slug"; skipped=$(( skipped + 1 )); return 0; }
+
+  # 3. terminal gate — the same parser cb-unlanded classifies with, not a
+  # second frontmatter reader. A body line named `status:` is not frontmatter
+  # and must not be able to declare a running task finished.
+  st="$(ul_report_field "$rep" status || true)"
+  case "$st" in
+    complete|done|partial) : ;;
+    *) printf '  - skipped: %s (status=%s, not terminal)\n' "$slug" "${st:-<none>}"
+       skipped=$(( skipped + 1 )); return 0;;
+  esac
+
+  # 4. clearance (§4). `|| true` because ul_clearance returns non-zero when the
+  # brief is missing, which under `set -e` would kill the whole run on exactly
+  # the case below.
+  #
+  # EMPTY CLEARANCE LANDS AS `standard`, and that inverts today's fail-closed
+  # rule on purpose. `clearance:` is SCRIPT-written now (cb-brief stamps it), so
+  # an absent field is a scaffold bug — a hand-written or pre-cb-brief task —
+  # not a sensitivity signal. Fail-closed on a scaffold bug strands the finding
+  # permanently, which is strictly worse than filing it into 00 Inbox/, the
+  # folder whose entire purpose is untriaged capture. Genuinely sensitive
+  # material is declared, and a declared value still blocks.
+  cl="$(ul_clearance "$td/brief.md" || true)"
+  case "$cl" in
+    standard|'') : ;;
+    confidential)
+      surface "$slug" 'clearance: confidential — surfaced only, never auto-filed'
+      return 0;;
+    *)
+      surface "$slug" "unrecognised clearance \`$cl\` — not filed"
+      return 0;;
+  esac
+
+  # 5. destination — meta first, computed fallback second. A task scaffolded
+  # before wave 1 has no `deliverable=`; recomputing gets it filed, but the date
+  # is whenever the lander ran rather than when the task was scaffolded, so the
+  # log says so and the provenance block records both.
+  dest="$(grep -m1 '^deliverable=' "$td/meta" 2>/dev/null | cut -d= -f2- || true)"
+  if [ -z "$dest" ]; then
+    dest="$(cb_deliverable_path "$kind" "$slug" || true)"
+    recomputed=' (path recomputed — task predates the computed-path meta)'
+  fi
+  if ! cb_land_dest_ok "$dest" 2>/dev/null; then
+    surface "$slug" "refused destination \`${dest:-<none>}\` — must be a plain file under 00 Inbox/"
+    return 0
+  fi
+
+  src="$rep"
+  at="$(date -Is)"
+
+  # 6. collision — never clobber. The one exception is our own prior landing:
+  # if `<td>/landed` records this exact destination AND re-stamping with the
+  # timestamp already recorded there reproduces the file byte for byte, the run
+  # is a no-op rather than a refusal. `landed_at` is the only field that moves
+  # between runs, which is why cb_land_stamp takes it as an argument.
+  if [ -e "$VAULT/$dest" ]; then
+    prior="$(cat "$td/landed" 2>/dev/null || true)"
+    if [ "$prior" = "$dest" ]; then
+      local prior_at
+      prior_at="$(ul_report_field "$VAULT/$dest" landed_at || true)"
+      if [ -n "$prior_at" ] \
+      && cb_land_stamp "$rep" "$slug" "$kind" "$src" "$prior_at" | cmp -s - "$VAULT/$dest"; then
+        printf '  = already landed: %s -> %s\n' "$slug" "$dest"
+        return 0
+      fi
+    fi
+    surface "$slug" "destination \`$dest\` already exists — refused, not clobbered"
+    return 0
+  fi
+
+  if [ -n "$dry" ]; then
+    printf '  WOULD land: %s -> %s%s\n' "$slug" "$dest" "$recomputed"
+    landed=$(( landed + 1 )); LANDED_PATHS+=("$dest"); return 0
+  fi
+
+  # 7. write, with provenance stamped into the report's own frontmatter.
+  # Streamed straight into atomic_write, NOT via `$(...)` — a command
+  # substitution eats trailing newlines, so the written bytes would differ from
+  # what cb_land_stamp emits and the byte-compare above could never match.
+  #
+  # GUARDED, because this is the operation that can actually fail at runtime —
+  # a full disk, a permission, a destination whose parent is a regular file —
+  # and an unguarded failure here kills a whole `--drain` under `set -e`,
+  # against the promise at the top of this function. C4 was one instance of the
+  # same class. A failure is a counted line and the run continues; nothing is
+  # marked landed, so the next tick retries.
+  if ! cb_land_stamp "$rep" "$slug" "$kind" "$src" "$at" | atomic_write "$VAULT/$dest"; then
+    printf '  ! failed: %s -> %s (write failed — not landed, will retry)\n' "$slug" "$dest"
+    skipped=$(( skipped + 1 )); return 0
+  fi
+
+  # 8. mark landed, and stop the register crying wolf about a report that is now
+  # demonstrably in the vault. Same guard, same reason: the file IS in the vault
+  # at this point, so a marker failure must not abort the other tasks. Without
+  # the marker the next run re-lands it, and the byte-identical re-land path
+  # (step 6) makes that a no-op rather than a collision.
+  if ! printf '%s\n' "$dest" | atomic_write "$td/landed"; then
+    printf '  ! partial: %s -> %s (landed, but the marker did not write)\n' "$slug" "$dest"
+  fi
+  ul_register_clear "$REGISTER" "$slug" || true
+  # a refusal that has since been resolved must not keep suppressing a future
+  # one (e.g. the collision is cleared, the report is re-landed, then a NEW
+  # collision appears — that second one is news and has to reach the worklist)
+  rm -f "$td/surfaced"
+
+  printf '  + landed: %s -> %s%s\n' "$slug" "$dest" "$recomputed"
+  landed=$(( landed + 1 )); LANDED_PATHS+=("$dest")
+}
+
+# --- select the task set -----------------------------------------------------
+if [ "$mode" = one ]; then
+  land_one "$one_slug"
+else
+  for td in "$CB_HOME"/tasks/*/; do
+    [ -d "$td" ] || continue
+    slug="$(basename "$td")"
+    # A task still being worked is not unlanded, it is unfinished — and its
+    # report.md may be a stale artifact from a prior dispatch. NB these two
+    # helpers ECHO a state (alive|gone|unavailable); they do not return one, so
+    # using them as bare conditions reads every task as live (cb-unlanded:161).
+    if [ "$(cb_window_alive "$slug" 2>/dev/null)" = alive ] \
+    || [ "$(cb_session_present "$slug" 2>/dev/null)" = alive ]; then
+      printf '  - skipped: %s (still live)\n' "$slug"; skipped=$(( skipped + 1 )); continue
+    fi
+    # CALLED BARE ON PURPOSE — do not "harden" this with `|| true`. Measured
+    # 2026-08-15: bash disables `errexit` for the WHOLE body of a function
+    # invoked in a tested context, so `land_one "$slug" || …` does not contain
+    # the failure, it removes the error handling inside land_one. A failed
+    # destination write then falls through to the next statement, the task is
+    # marked `landed` and announced as landed, and `git add` aborts the run on a
+    # pathspec that does not exist — a false success plus a broken commit, in
+    # place of an honest abort. The promise at :109 is kept where it belongs,
+    # inside land_one: every operation that can fail is guarded there and turns
+    # into a counted line, so a bad task never reaches the loop as an error.
+    land_one "$slug"
+  done
+fi
+
+# --- one local commit, exact paths only, never a push ------------------------
+# `git add -- <paths>` and `git commit -- <paths>`, both. Passing the paths to
+# BOTH is the part that matters: `git commit` without a pathspec writes the
+# whole index, so a live X-Man's staged work would ride along in a commit
+# claiming to be one report's landing.
+#
+# flock'd because cb-watch calls this every ~30s and a live session (or the
+# routing pass, or cb-ingest) can hold `.git/index.lock` at any moment.
+#
+# LANDED REPORTS ONLY — the shared ratify worklist is deliberately absent from
+# `paths` (C1, see surface() above). Consequence: a run that only SURFACED makes
+# no commit at all, which is why there is no `0 landed, N surfaced` subject any
+# more. Nothing is lost — the worklist append is on disk for Kyle either way,
+# and it is /eod's commit that carries it, as it does for every other writer of
+# that file.
+if [ -z "$dry" ] && [ "$landed" -gt 0 ]; then
+  if git -C "$VAULT" rev-parse --git-dir >/dev/null 2>&1; then
+    paths=()
+    for p in ${LANDED_PATHS[@]+"${LANDED_PATHS[@]}"}; do paths+=("$p"); done
+    subject="land: $LOCAL — $landed report(s)"
+    {
+      flock 9
+      # NEVER redirect stderr on `git add`: one unmatched pathspec aborts the
+      # whole add, and a silenced abort commits nothing while reporting success.
+      git -C "$VAULT" add -- "${paths[@]}"
+      git -C "$VAULT" commit -q -m "$subject
+
+Filed by cb-land from finished research/ops task reports. The destination was
+computed at scaffold time (lib/land.sh) and stamped into task meta, so nothing
+here is a routing decision — 00 Inbox/ is untriaged capture and /ingest and the
+distiller still own what the findings mean.
+
+Provenance is in each file's frontmatter (landed_from / landed_slug /
+landed_at). Surfaced-not-filed: $surfaced. Local commit, never pushed." \
+        -- "${paths[@]}" >/dev/null
+    } 9>"$LOCKDIR/vault-git.lock"
+  else
+    echo "cb-land: '$VAULT' is not a git repo — files written, nothing committed" >&2
+  fi
+fi
+
+printf 'cb-land: %d landed, %d surfaced, %d skipped%s%s\n' \
+  "$landed" "$surfaced" "$skipped" \
+  "$( [ "$resurfaced" -gt 0 ] && printf ' (%d already surfaced, unchanged)' "$resurfaced" )" \
+  "${dry:+ (dry run — nothing written)}"
+exit 0

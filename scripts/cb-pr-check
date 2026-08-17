@@ -1,0 +1,147 @@
+#!/usr/bin/env bash
+# scripts/cerebro/cb-pr-check <slug> — turn a finished conductor run into a
+# real PR: resolve the run (lib/conductor.sh), parse 04-ship.md (BOTH live
+# shapes — Evidence 6: template frontmatter vs `## PR` bullets + fenced
+# description), verify the branch is pushed, REST-create the PR via the
+# registry's delivery adapter, arm the merge poll (pr + pr.state files), and
+# derive summary.md (the operator review surface — written only after a
+# successful create so a failed create never reads as ready-for-review).
+# Idempotent: an existing pr file means the PR is already open — no duplicate.
+set -euo pipefail
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$here/lib/paths.sh"; source "$here/lib/registry.sh"; source "$here/lib/conductor.sh"; source "$here/lib/classify.sh"
+
+slug=""; base_override=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --base) base_override="${2:-}"; shift 2 || { echo "cb-pr-check: --base needs a branch" >&2; exit 2; };;
+    --base=*) base_override="${1#--base=}"; shift;;
+    -*) echo "usage: cb-pr-check <slug> [--base <branch>]" >&2; exit 2;;
+    *) [ -n "$slug" ] && { echo "usage: cb-pr-check <slug> [--base <branch>]" >&2; exit 2; }
+       slug="$1"; shift;;
+  esac
+done
+[ -n "$slug" ] || { echo "usage: cb-pr-check <slug> [--base <branch>]" >&2; exit 2; }
+td="$(cb_task_dir "$slug")"
+[ -f "$td/meta" ] || { echo "cb-pr-check: no meta for $slug — not a dispatched code task" >&2; exit 1; }
+[ "$(_meta_field "$td" kind)" = "code" ] || { echo "cb-pr-check: $slug is not a code task" >&2; exit 1; }
+
+if [ -f "$td/pr" ]; then
+  echo "cb-pr-check: PR already created for $slug ($(cat "$td/pr")) — poll with cb-merge"
+  exit 0
+fi
+
+wt="$(_meta_field "$td" worktree)"
+jira="$(_meta_field "$td" jira)"
+target="$(_meta_field "$td" target)"
+[ -n "$target" ] || { echo "cb-pr-check: meta has no target project" >&2; exit 1; }
+
+run="$(resolve_run "$wt" "$slug" "$jira")"
+ship="$run/04-ship.md"
+[ -f "$ship" ] || { echo "cb-pr-check: no 04-ship.md in $run — conductor hasn't shipped yet" >&2; exit 1; }
+
+# --- parse 04-ship.md, both shapes ---------------------------------------
+branch=""; title=""; body_file="$(mktemp)"; trap 'rm -f "$body_file"' EXIT
+if head -1 "$ship" | grep -q '^---' && awk '/^---[[:space:]]*$/{n++; next} n==1 && /^branch:/{found=1} END{exit !found}' "$ship"; then
+  # shape A — pull-request skill Step 8 template: frontmatter pr_url/branch/
+  # target/jira; body is the ship record itself.
+  branch="$(awk '/^---[[:space:]]*$/{n++; next} n==1 && /^branch:/{sub(/^branch:[[:space:]]*/,""); print; exit}' "$ship")"
+  [ -n "$jira" ] || jira="$(awk '/^---[[:space:]]*$/{n++; next} n==1 && /^jira:/{sub(/^jira:[[:space:]]*/,""); print; exit}' "$ship")"
+  awk '/^---[[:space:]]*$/{n++; next} n>=2{print}' "$ship" > "$body_file"
+  h1="$(grep -m1 '^# ' "$body_file" | sed 's/^# *//; s/^Ship — *//')"
+  title="$h1"
+  if [ -n "$jira" ] && [[ "$title" != *"$jira"* ]]; then title="$jira: $title"; fi
+else
+  # shape B — live ship-record: `## PR` bullets (Branch / Create-PR URL /
+  # Title) + fenced `### Proposed PR description` block.
+  # The leading bullet is OPTIONAL and the `|| true` is load-bearing. Two
+  # defects stacked here until 2026-08-14 and between them they stranded three
+  # branches carrying finished work:
+  #   1. the anchor required '^- **Branch:**', but conductors write BOTH the
+  #      bulleted form and a bare '**Branch:**' — a survey of the live
+  #      04-ship.md corpus found both shapes in roughly equal numbers;
+  #   2. under `set -euo pipefail` a no-match grep makes the whole command
+  #      substitution fail, which aborted the script HERE — before the
+  #      "could not parse a branch" handler twelve lines below could fire. So
+  #      the operator got exit 1 and NO output at all, which is why defect 1
+  #      went unnoticed across two dead conductors for three days.
+  # Repro of the silent-abort half:
+  #   bash -c 'set -euo pipefail; x="$(grep nomatch /etc/hostname)"; echo never'
+  branch="$(grep -m1 '^[-*]\? *\*\*Branch:\*\*' "$ship" | sed -n 's/.*\*\*Branch:\*\* `\([^`]*\)`.*/\1/p' || true)"
+  title="$(grep -m1 '^[-*]\? *\*\*Title:\*\*' "$ship" | sed -n 's/.*\*\*Title:\*\* `\([^`]*\)`.*/\1/p' || true)"
+  awk '/^### Proposed PR description/{sect=1; next}
+       sect && /^```/{ if (!inblk) { inblk=1; next } else exit }
+       inblk { print }' "$ship" > "$body_file"
+fi
+[ -n "$branch" ] || { echo "cb-pr-check: could not parse a branch out of $ship" >&2; exit 1; }
+[ -s "$body_file" ] || { echo "cb-pr-check: could not parse a PR description out of $ship" >&2; exit 1; }
+[ -n "$title" ] || title="${jira:+$jira: }$slug"
+
+# --- precondition: the branch is actually pushed (spec §7) ----------------
+_git() { if [ -n "${CB_GIT_CMD:-}" ]; then eval "$CB_GIT_CMD" '"$@"'; else git "$@"; fi; }
+if [ -z "$(_git -C "$wt" ls-remote --heads origin "$branch")" ]; then
+  echo "cb-pr-check: branch $branch is not pushed to origin — push it first (the conductor's ship phase should have)" >&2
+  exit 1
+fi
+
+# --- delivery adapter (registry-driven) -----------------------------------
+delivery="$(registry_field "$target" delivery)"
+base="$(registry_field "$target" base)"; : "${base:=main}"
+# --base overrides the registry default. Added 2026-08-13: the registry has ONE
+# base per project, but during a release cut there are two live destinations —
+# main and the release branch — and which one a change belongs to is a
+# release-criticality judgement, not a property of the repo. Without this the
+# only ways to target the release branch were a browser create or raw REST, and
+# both skip the default-reviewer fetch below, which is exactly how PRs shipped
+# unreviewable in August (feedback_pr_creation_no_browser).
+[ -n "$base_override" ] && base="$base_override"
+case "$delivery" in
+  bitbucket-pr)
+    adapter="$here/delivery/bitbucket.sh"
+    # reviewers row absent -> omit the field; Bitbucket's repo default
+    # reviewers auto-assign (Kyle 2026-07-13). A PRESENT row still goes
+    # through registry_reviewers, so leftover {uuid-*} placeholders refuse
+    # loudly rather than shipping wrong.
+    if [ -n "$(registry_field "$target" reviewers)" ]; then
+      reviewers="$(registry_reviewers "$target")"
+    else
+      reviewers='[]'
+    fi
+    export CB_BB_WORKSPACE="$(registry_field "$target" workspace)"
+    export CB_BB_REPO="$(registry_field "$target" repo)"
+    ;;
+  local-only)
+    adapter="$here/delivery/local-only.sh"
+    reviewers='[]'
+    ;;
+  *)
+    echo "cb-pr-check: project $target has delivery '$delivery' — not a deliverable row" >&2
+    exit 1;;
+esac
+
+rc=0
+out="$("$adapter" create_pr "$title" "$branch" "$base" "$body_file" "$reviewers")" || rc=$?
+if [ "$rc" -eq 3 ]; then
+  mkdir -p "$CB_HOME/logs"
+  printf '%s %s escalate (token dead — create_pr 401)\n' "$(date -Is)" "$slug" >> "$CB_HOME/logs/events"
+  echo "cb-pr-check: escalate — dead token, see ~/.cerebro/logs/events" >&2
+  exit 3
+elif [ "$rc" -ne 0 ]; then
+  echo "cb-pr-check: create_pr failed (rc=$rc)" >&2
+  exit "$rc"
+fi
+url="${out% *}"; id="${out##* }"
+printf '%s %s' "$id" "$url" | atomic_write "$td/pr"
+printf 'OPEN' | atomic_write "$td/pr.state"
+
+# --- summary.md: the operator review surface (spec §6.3), post-create so a
+# failed create never classifies ready-for-review -------------------------
+{
+  printf -- '---\ntask: %s\ntype: code\njira: %s\nbranch: %s\npr: %s\nsource: %s\ncreated: %s\n---\n\n' \
+    "$slug" "$jira" "$branch" "$url" "$ship" "$(date -Is)"
+  printf '# PR description\n\n'
+  cat "$body_file"
+  printf '\n# Review notes (operator)\n\n- \n'
+} | atomic_write "$td/summary.md"
+
+echo "cb-pr-check: opened $url (id $id) for $slug — summary at $td/summary.md"

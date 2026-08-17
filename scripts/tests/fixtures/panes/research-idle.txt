@@ -1,0 +1,4 @@
+⏺ I've gathered the sources and written the outline.
+
+> Press up to edit queued messages
+new task? /clear

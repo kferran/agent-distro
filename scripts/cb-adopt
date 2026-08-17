@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# scripts/cerebro/cb-adopt — report reconcile state (dry, never mutates).
+# Research tasks reconcile against cb-session windows; code tasks (T39)
+# against their per-slug conductor sessions; and active dev items are
+# cross-checked against task dirs (the §8.2 three-surface reconcile,
+# session-state-check-style labels: active / stale / orphaned / untracked).
+set -euo pipefail
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"; source "$here/lib/paths.sh"; source "$here/lib/classify.sh"
+: "${CB_VAULT:=$HOME/vault}"
+# window list: bare slugs, one per line — windows live in the dedicated "cb"
+# tmux session, named by slug (not "cb:<slug>"). Overridable for tests. "|| true"
+# so a missing cb session yields an empty list rather than a set -e death.
+list_windows() { eval "${CB_WINDOW_LIST_CMD:-tmux list-windows -t cb -F '#{window_name}' 2>/dev/null || true}"; }
+mapfile -t windows < <(list_windows)
+has_window() { local s="$1"; for w in "${windows[@]:-}"; do [ "$w" = "$s" ] && return 0; done; return 1; }
+# tasks vs their host: research → cb window, code → per-slug session
+for d in "$CB_HOME"/tasks/*/; do
+  [ -d "$d" ] || continue; slug="$(basename "$d")"
+  if [ "$(_meta_field "${d%/}" kind)" = "code" ]; then
+    sess="$(_meta_field "${d%/}" session)"; [ -n "$sess" ] || sess="$slug"
+    if [ "$(cb_session_alive "$sess")" = "alive" ]; then echo "active-code $slug"; else echo "stale-code $slug"; fi
+  else
+    if has_window "$slug"; then echo "active $slug"; else echo "stale $slug"; fi
+  fi
+done
+# windows with no task dir
+for w in "${windows[@]:-}"; do
+  [ -d "$(cb_task_dir "$w")" ] || echo "orphaned $w"
+done
+# dev-item cross-check: an ACTIVE item with no Cerebro task dir is work the
+# coordinator can't see (pre-Cerebro spawn, or state drift) — report only
+items_dir="$CB_VAULT/00 Inbox"
+if [ -d "$items_dir" ]; then
+  for f in "$items_dir"/*.md; do
+    [ -f "$f" ] || continue
+    st="$(awk '/^---[[:space:]]*$/{n++; next} n==1 && /^status:/{sub(/^status:[[:space:]]*/,""); sub(/[[:space:]]*$/,""); print; exit}' "$f")"
+    [ "$st" = "active" ] || continue
+    islug="$(awk '/^---[[:space:]]*$/{n++; next} n==1 && /^slug:/{sub(/^slug:[[:space:]]*/,""); sub(/[[:space:]]*$/,""); print; exit}' "$f")"
+    [ -n "$islug" ] || islug="$(basename "$f" .md)"
+    [ -d "$(cb_task_dir "$islug")" ] || echo "untracked-item $islug"
+  done
+fi

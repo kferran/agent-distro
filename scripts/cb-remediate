@@ -1,0 +1,125 @@
+#!/usr/bin/env bash
+# scripts/cerebro/cb-remediate <slug> — spend-wedge verify-then-resume
+# (M6, spec §8.3 — the ONE registered auto-remediation; everything else is
+# notify-only). Invoked by cb-watch every tick while a task is blocked.
+#
+#   verify-probe (load-bearing): resume only when spend is DEMONSTRABLY
+#   flowing again — never nudge into a dead cap; a failed probe holds and
+#   re-checks next tick (no marker, so the hold is retriable).
+#   cap: CB_REMEDIATE_CAP (2) resumes per task; beyond it, escalate (event +
+#   page via cb-notify) instead of hammering.
+#   idempotency: one action per wedge EPISODE — the .remediated marker being
+#   newer than the blocked event's .eventhash beacon means this episode was
+#   already handled; a fresh blocked event (newer beacon) re-arms it.
+set -euo pipefail
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$here/lib/paths.sh"; source "$here/lib/classify.sh"
+: "${CB_RESUME_LINE:=continue}"   # capture the reliably-un-wedging line from the next real wedge (plan 2 open question)
+: "${CB_REMEDIATE_CAP:=2}"
+
+slug="${1:-}"; [ -n "$slug" ] || { echo "usage: cb-remediate <slug>" >&2; exit 2; }
+td="$(cb_task_dir "$slug")"
+
+# M6 req 4 — defensive not-already-terminal gate. Independent of classify: even
+# if a classify regression labels a shipped task `blocked`, remediation must
+# NEVER resume something already terminal. Refuse + log loudly + mark (no retry).
+if [ -f "$td/summary.md" ] || [ "$(cat "$td/pr.state" 2>/dev/null)" = "MERGED" ] || [ -f "$td/done" ]; then
+  mkdir -p "$CB_HOME/logs" "$CB_HOME/beacons"
+  printf '%s %s misclassification (terminal signal present — remediation refused)\n' \
+    "$(date -Is)" "$slug" >> "$CB_HOME/logs/events"
+  touch "$CB_HOME/beacons/$slug.remediated"
+  exit 0
+fi
+
+hashfile="$CB_HOME/beacons/$slug.eventhash"
+marker="$CB_HOME/beacons/$slug.remediated"
+[ -f "$hashfile" ] || exit 0
+if [ -f "$marker" ] && [ "$marker" -nt "$hashfile" ]; then exit 0; fi   # episode already handled
+
+mkdir -p "$CB_HOME/logs"
+# (b) scope-add #2 — require a FRESH wedge signature present NOW, before ANY
+# remediation action (resume OR the cap-exhausted page). The carried `blocked`
+# can be stale (a real wedge that recovered) or a false match: classify's wedge
+# pattern includes idle chrome (`new task? /clear`, the queued-messages banner)
+# that a HEALTHY just-finished / awaiting-PR session shows too. Act only on a
+# genuine spend banner (CB_SPEND_PATTERN) with no turn in progress (CB_BUSY) and
+# no human-gate menu (CB_MENU). Otherwise HOLD — no marker (retriable), never
+# bump the count, never page 'exhausted' against a session that isn't wedged
+# (which is how eja-3600 burned 2/2 into a false needs-relaunch while idle).
+sess="$(_meta_field "$td" session)"; [ -n "$sess" ] || sess="$slug"
+pane="$(cb_pane_tail "$sess")"
+if ! printf '%s\n' "$pane" | grep -qE "$CB_SPEND_PATTERN" \
+   || printf '%s\n' "$pane" | grep -qE "$CB_BUSY_PATTERN" \
+   || printf '%s\n' "$pane" | grep -qE "$CB_MENU_PATTERN"; then
+  # Log the hold ONCE PER EPISODE, not once per poll. The hold is retriable by
+  # design (no `.remediated` marker), so this branch re-runs every tick for as
+  # long as the carried `blocked` sticks around — and it was writing a line
+  # every ~53s. Measured 2026-08-12: 3,593 of the 12,219 lines in
+  # $CB_HOME/logs/events were this one string, 29% of the fleet's liveness log,
+  # which is the log agent-liveness checks read as truth. A hold is a state, and
+  # a state belongs in the log once when it is entered.
+  # Keyed on $hashfile so a NEW episode logs again: same episode-scoping the
+  # `.remediated` marker uses on line 37.
+  holdlog="$CB_HOME/beacons/$slug.hold-logged"
+  if [ ! -f "$holdlog" ] || [ "$hashfile" -nt "$holdlog" ]; then
+    printf '%s %s remediation held (no live spend-wedge signal — carried blocked stale/false)\n' \
+      "$(date -Is)" "$slug" >> "$CB_HOME/logs/events"
+    touch "$holdlog"
+  fi
+  exit 0
+fi
+
+count="$(cat "$td/remediation-count" 2>/dev/null || echo 0)"
+
+if [ "$count" -ge "$CB_REMEDIATE_CAP" ]; then
+  printf '%s %s blocked (remediation exhausted %s/%s — paging)\n' \
+    "$(date -Is)" "$slug" "$count" "$CB_REMEDIATE_CAP" >> "$CB_HOME/logs/events"
+  "$here/cb-notify" "$slug" blocked-exhausted "spend-wedge" || true
+  touch "$marker"
+  exit 0
+fi
+
+# spend_flowing — the verify-probe. Mockable via CB_SPEND_PROBE_CMD (exit 0 =
+# flowing). Default heuristic: any OTHER task's conductor manifest bumped
+# within the last two ticks — evidence the account is spending again.
+spend_flowing() {
+  if [ -n "${CB_SPEND_PROBE_CMD:-}" ]; then eval "$CB_SPEND_PROBE_CMD"; return; fi
+  local d wt run m window=$(( ${CB_TICK_SECS:-30} * 2 ))   # 2 ticks; tracks cb-watch's tick default (finding #3)
+  for d in "$CB_HOME"/tasks/*/; do
+    [ -d "$d" ] || continue
+    [ "$(basename "$d")" = "$slug" ] && continue
+    [ "$(_meta_field "${d%/}" kind)" = "code" ] || continue
+    wt="$(_meta_field "${d%/}" worktree)"; [ -n "$wt" ] || continue
+    run="$(resolve_run "$wt" "$(basename "$d")" "$(_meta_field "${d%/}" jira)" 2>/dev/null)" || continue
+    m="$run/manifest.md"; [ -f "$m" ] || continue
+    if [ $(( $(date +%s) - $(stat -c %Y "$m") )) -lt "$window" ]; then return 0; fi
+  done
+  return 1
+}
+
+if ! spend_flowing; then
+  exit 0   # hold — no marker, re-check next tick; never resume into a dead cap
+fi
+
+# The cap bounds how often we TRY, not how often we succeed. cb-send can now
+# legitimately refuse (exit 3) — no composer after its wait, or a composer holding
+# someone else's text — and under `set -e` a bare call would abort this script
+# before the count++ below, so a permanently-unreachable pane would retry every
+# tick forever and silently bypass CB_REMEDIATE_CAP. Count the attempt either way;
+# log the refusal so it is visible rather than looking like a delivered resume.
+# (2026-07-30, alongside cb-send's never-type-blind change.)
+# A wedged agent is showing a spend-limit / usage-wall screen, which has NO
+# composer — so cb-send's wait-then-refuse default can never succeed here, and
+# would silently disable auto-remediation entirely. This is the one sanctioned
+# blind send in the system: we are deliberately typing at a pane we cannot read,
+# because that is exactly what un-wedging requires. (2026-07-30.)
+if ! CB_SEND_ALLOW_BLIND=1 "$here/cb-send" "$slug" "$CB_RESUME_LINE"; then
+  printf '%s %s remediate-send-refused (attempt %s/%s)\n' \
+    "$(date -Is)" "$slug" "$(( count + 1 ))" "$CB_REMEDIATE_CAP" >> "$CB_HOME/logs/events"
+fi
+count=$(( count + 1 ))
+printf '%s' "$count" | atomic_write "$td/remediation-count"
+printf '%s %s auto-resumed attempt %s/%s (spend-wedge)\n' \
+  "$(date -Is)" "$slug" "$count" "$CB_REMEDIATE_CAP" >> "$CB_HOME/logs/events"
+touch "$marker"
+echo "cb-remediate: resumed $slug (attempt $count/$CB_REMEDIATE_CAP)"

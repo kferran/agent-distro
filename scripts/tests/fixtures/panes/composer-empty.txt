@@ -1,0 +1,8 @@
+✻ Crunched for 1m 26s
+                                         new task? /clear to save 130.4k tokens
+────────────────────────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────────────────────────
+  ultron  |  fe/eja-3890-esign-phone-type-allowlist  |  [░░░░░░░░░░] 13%  |  O…
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents
+                                                                            /rc

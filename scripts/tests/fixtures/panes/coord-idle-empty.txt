@@ -1,0 +1,24 @@
+
+  Minor precision point if it comes up: Ryan's "the ID doesn't exist until the
+  XML103 API call" isn't quite right — submissionGuid is minted at the start of
+  submission, before the payload is built. Doesn't change his conclusion for the
+  other docs, but it's why the TDR case works.
+
+  Two things I couldn't settle
+
+  I did not examine Dashboard search fields, so I can't cost his second
+  objection ("cannot be searched for on the Dashboard") — flagging rather than
+  guessing. Also unverified: whether EDJ FSD retains the TransRefGUID, and
+  whether a raw GUID is quotable by their operators.
+
+  Beacon back to paused. Report at 778 lines with a # UPDATE after pulling the
+  Slack thread section. Want me to check the Dashboard search surface while you
+  wait on Albert? That's the one open piece of his objection I could close.
+
+✻ Crunched for 3m 0s
+                                         new task? /clear to save 348.4k tokens
+────────────────────────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────────────────────────
+  ultron  |  fe/main  |  [░░░░░░░░░░] 35%  |  Opus 5
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents

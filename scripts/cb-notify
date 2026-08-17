@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+# scripts/cerebro/cb-notify <slug> <state> [gate] — the minimal §8.1
+# escalation skeleton: hold-by-default, hard-interrupt ONLY for needs-input
+# (an idling agent burning wall clock). After a grace hold (CB_GRACE_SECS,
+# default 90 — §11 operator input), send ONE line into the Cerebro
+# coordinator session. Every other state stays board-only (batch on surface).
+# Dedup rides T21's event hash: one send per (state, gate) event; a new gate
+# is a new event and notifies again. cb-watch calls this every tick for
+# needs-input tasks so the hold matures without a fresh event. Focus/catch-up
+# modes land in M7 (T32's mode file gates this too).
+set -euo pipefail
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"; source "$here/lib/paths.sh"; source "$here/lib/push.sh"; source "$here/lib/coordinator.sh"; source "$here/lib/wake.sh"
+: "${CB_GRACE_SECS:=90}"
+: "${CB_SESSION:=Cerebro}"
+# R16 focus-ceiling: a deferred escalation held longer than this stops being
+# invisible via an out-of-band push. Default-ON (a safe value even if the
+# operator never configured it) — the 2026-07-10 firstmate incident was 20
+# escalations sat buffered 8.5h behind a silent focus/wedge.
+: "${CB_MAX_DEFER_SECS:=300}"
+
+slug="${1:-}"; state="${2:-}"; gate="${3:-}"
+[ -n "$slug" ] && [ -n "$state" ] || { echo "usage: cb-notify <slug> <state> [gate]" >&2; exit 2; }
+
+hashfile="$CB_HOME/beacons/$slug.eventhash"
+[ -f "$hashfile" ] || exit 0
+sent="$CB_HOME/beacons/$slug.notified"
+code=""   # P4: the enumerated escalation reason; cb_escalate refuses without one
+
+case "$state" in
+  needs-input)
+    # grace-held; content dedup — one send per (state, gate) event
+    age=$(( $(date +%s) - $(stat -c %Y "$hashfile") ))
+    [ "$age" -ge "$CB_GRACE_SECS" ] || exit 0
+    hash="$(cat "$hashfile")"
+    [ "$(cat "$sent" 2>/dev/null)" = "$hash" ] && exit 0
+    code=decision
+    ;;
+  blocked-exhausted)
+    # a cap-2-exhausted spend wedge (cb-remediate) pages IMMEDIATELY — the
+    # wedge already burned two resume attempts plus its stall window; no
+    # grace. Dedup by mtime, not content: each new episode carries the same
+    # blocked|gate hash, and each one deserves its own page.
+    if [ -f "$sent" ] && [ "$sent" -nt "$hashfile" ]; then exit 0; fi
+    hash="$(cat "$hashfile")"
+    code=blocked-exhausted
+    ;;
+  needs-relaunch)
+    # M6: auto-remediation exhausted and the wedge persists — a human must
+    # relaunch. Page IMMEDIATELY (no grace). Dedup by mtime, not content: each
+    # new episode deserves its own page.
+    if [ -f "$sent" ] && [ "$sent" -nt "$hashfile" ]; then exit 0; fi
+    hash="$(cat "$hashfile")"
+    code=needs-relaunch
+    ;;
+  *) exit 0;;   # everything else stays board-only
+esac
+
+# This is a DELIVERABLE escalation (grace matured / cap exhausted, not already
+# sent). cb_escalate (lib/coordinator.sh) owns the shared delivery path: focus
+# hold, R17 composer guard + R19 sentinel via cb_coord_send, and the R16 ceiling
+# out-of-band alarm on a defer past CB_MAX_DEFER_SECS. On delivery we own the
+# per-event dedup (.notified = the event hash).
+msg="cb-watch: $slug $state${gate:+ ($gate)}"
+defer_age=$(( $(date +%s) - $(stat -c %Y "$hashfile") ))
+# R4 — the wake is recorded BEFORE anything can suppress it, and unconditionally.
+# Enqueueing only on a deferred delivery would close the wrong window: a
+# successful cb_coord_send means send-keys worked, not that a coordinator ever
+# read the composer. The gap this shuts is escalation-decided -> `.notified`
+# advanced -> coordinator dies before reading, after which nothing ever makes it
+# look. Nothing acknowledges the entry here; a coordinator draining it does.
+cb_wake_enqueue "$slug" "$state" "$gate" "$hash" "$msg" || \
+  printf '%s WAKE-ENQUEUE-FAILED %s %s\n' "$(date -Is)" "$slug" "$state" >> "$CB_HOME/logs/events"
+if cb_escalate "$msg" "$defer_age" "$CB_HOME/beacons/$slug.defer-alarmed" "$hash" "$code"; then
+  printf '%s' "$hash" | atomic_write "$sent"   # dedup: one send per (state,gate) event
+fi
+exit 0
