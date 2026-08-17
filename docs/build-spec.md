@@ -16,8 +16,15 @@ and the vault keeps a pointer. Do not edit both.
 
 **Status:** Amended draft, implementation-ready for Phases 0–4.
 **Audience:** The implementing agent (Claude Code) and the operator (Kyle).
-**Deployment target:** `np-kf1-cus`, Porch-provisioned, always-on. The original text said Ubuntu Server
-24.04 LTS; the box is Debian 12 bookworm. Confirm at Phase 0 and fix the unit files accordingly.
+**Deployment target:** `np-kf1-cus`, Porch-provisioned, always-on. **Debian 12 bookworm** — verified
+2026-08-17 against `/etc/os-release` (`ID=debian`, `VERSION_ID="12"`), `lsb_release`, and the kernel
+string (`Debian 6.1.180-1`). The original text said Ubuntu Server 24.04 LTS; it is not. Build against
+bookworm package versions, not noble.
+
+⚠️ One apt source disagrees and is worth fixing before Phase 0 installs anything:
+`packages.microsoft.com/ubuntu/24.04/prod noble main` is configured on this Debian host, while the
+sibling Microsoft, Docker and Tailscale sources all correctly target `bookworm`. Packages built for
+noble can pull mismatched runtime deps on bookworm.
 
 ## Decisions of record — Kyle, 2026-08-17
 
@@ -34,6 +41,12 @@ and the vault keeps a pointer. Do not edit both.
 | 9 | Add Telegram or Slack as an alert channel? | **No** |
 | 10 | Do the four daily rituals move to systemd? | **Yes — and every ritual must also run from cron, by hand, and on a non-Linux host** |
 | 11 | Does `CLAUDE.md` v0.24 land with the migration or after? | **After** |
+| 12 | Is `traces` default-on or opt-in? | **Default-on** — *"in case there ever is a prompt injection attack or I need to audit what was done"* |
+| 13 | Which scheduler survives, and what is the fallback? | **systemd, with cron or manual invocation as fallback** — see §8.1.1 for the cutover gap this exposes |
+| 14 | Who supplies `evals/commitments/`? | **Kyle**, ~30 hand-labeled messages — the input that sets `min_confidence` and the merge threshold |
+| 15 | Meeting transcripts as a fourth source? | **Yes** — Gemini notes plus third-party Zoom notes from EDJ, gated on the attribution check in §6.2.1 |
+| 16 | `traces` TTL vs audit retention? | **Exempt `suspected_injection = 1` rows from pruning**, retained indefinitely; everything else keeps the 30-day TTL |
+| 17 | Write the per-operation disposition table now, or at Phase 6? | **Phase 6** — deferred deliberately, and written into that phase's acceptance criteria so it cannot be skipped |
 
 ## 0. Blockers
 
@@ -44,7 +57,7 @@ briefly stood here are answered and their outcomes live in §8.1 and §5.2.
 |---|---|---|---|
 | B2 | Vault sync | git + obsidian-git auto-pull is the mechanism in use and stays. Syncthing would be a regression — git gives conflict markers and history. Doctor's `*.sync-conflict-*` check is therefore dead code; it needs "unmerged paths, or a merge commit touching a machine-owned region" instead. | Phase 3's Doctor check |
 | B3 | Unattended `claude -p` | The interactive credential works and has refreshed on this box since 2026-07-12. The unproven mode is the one this spec assumes: `claude -p` under `CLAUDE_CODE_OAUTH_TOKEN`, non-interactive, sandboxed. There is no `-p` invocation anywhere in `scripts/cerebro/` today. | Phase 0, and §8.3 |
-| B4 | Slack outbound | Reading works — the MCP is connected and `ns-comms-sweep` uses it nightly across 13 channels, DMs and `from:me` sent mail. Only the DM-to-self write path is unproven. | Phase 4's rung-2 DM |
+| B4 | Slack outbound | Reading works — the MCP is connected and `ns-comms-sweep` uses it nightly across 13 channels, DMs and `from:me` sent mail. Only the DM-to-self write path is unproven. | **Rung 3 only** (§6.5). Off the Phase 3 critical path, since rungs 1–2 are in-band and rung 3 cannot fire until a commitment has survived both. |
 
 Real connectors are permitted from Phase 2. The store's contents already exist in `~/vault` and
 `~/.cerebro` — this is company data on company infrastructure, and the retention and legal-hold question
@@ -83,8 +96,8 @@ credentials, and gets a working, empty system. If that fails, this is a personal
 identical from the outside. Rejects must be visible and countable.
 
 **I7 rationale.** The store holds item state; markdown renders it. What this buys is measurable in the
-surface it replaces — 710 files in `00 Inbox/` carrying **73 distinct `status:` values** against the
-five `CLAUDE.md` declares, **246 with no `decide-by:` at all**, and `timing:` (the field that picks
+surface it replaces — 715 files in `00 Inbox/` carrying **73 distinct `status:` values** against the
+five `CLAUDE.md` declares, **248 with no `decide-by:` at all**, **130 with no `status:` at all**, and `timing:` (the field that picks
 which drain claims an item) present in exactly one file, where it is the template comment pasted
 verbatim. A CHECK-constrained enum behind a single writer is the answer to that. Markdown remains the
 surface Kyle reads and writes prose into; it stops being where item state lives.
@@ -231,7 +244,7 @@ CREATE TABLE rejects (
 -- The work item. Holds both a chief-of-staff request and a dev item; see §5.1.
 CREATE TABLE queue (
   id             INTEGER PRIMARY KEY,
-  host           TEXT NOT NULL DEFAULT 'default',  -- which workspace; a NAME, never a path (§5.3)
+  host           TEXT NOT NULL DEFAULT 'default',  -- which workspace; a NAME, never a path (§5.4)
   platform       TEXT NOT NULL DEFAULT 'none',      -- which codebase: ultron|ironman|none (§5.1)
   slug           TEXT NOT NULL,          -- == branch name, stable across the lifecycle
   event_id       INTEGER REFERENCES events(id),   -- nullable: operator-captured items have none
@@ -255,13 +268,14 @@ CREATE TABLE queue (
   closed_at      TEXT,
   archived_at    TEXT,                   -- done is not finished...
   distilled_at   TEXT,                   -- ...finished is findings-landed
+  inferred       TEXT,                   -- fields the migration invented; NULL if authored (5.3)
   CHECK (status IN ('drafting','queued','active','needs-kyle','done','dropped')),
   CHECK (kind IN ('decision','dev-item','friction','opportunity','report')),
   CHECK (timing IN ('hourly','overnight')),
   CHECK (dispatch IN ('now','next-cycle','manual')),
   CHECK (severity IS NULL OR severity IN ('blocker','high','medium','low')),
   CHECK (platform IN ('ultron','ironman','none')),
-  UNIQUE (host, slug)     -- slugs are unique WITHIN a workspace, not globally (§5.3)
+  UNIQUE (host, slug)     -- slugs are unique WITHIN a workspace, not globally (§5.4)
 );
 
 CREATE INDEX idx_queue_status ON queue (host, status, decide_by);
@@ -364,7 +378,10 @@ CREATE TABLE traces (
   response    TEXT NOT NULL,
   created_at  TEXT NOT NULL DEFAULT (datetime('now'))
 );
--- TTL 30 days, pruned nightly.
+-- TTL 30 days, pruned nightly -- EXCEPT rows whose event carried
+-- suspected_injection = 1, which are exempt and retained indefinitely (7.4).
+-- Pruning is BY AGE ONLY, never by predicate: prune-traces must not be
+-- usable to destroy evidence selectively.
 ```
 
 ### 5.1 The work item
@@ -388,7 +405,7 @@ rather than a status value.
 
 **`platform` names the codebase the item touches — `ultron`, `ironman`, or `none`.** It is not a
 synonym for `host`, and it earns its place with a single vault, which is why it is here rather than
-deferred with the multi-workspace machinery in §5.3.
+deferred with the multi-workspace machinery in §5.4.
 
 Ultron (annuity) and Ironman (life) are *"separate codepaths, integrations, and submission flow"*
 (`03 Resources/glossary.md`), and the vault's knowledge tree already mirrors that split with parallel
@@ -446,7 +463,48 @@ failure this makes visible.
 **`cb-distill` and `cb-ingest` already do this work against markdown.** The migration keeps them
 running rather than replacing them.
 
-### 5.3 More than one workspace
+### 5.3 The migration contract — what Phase 6 does with incomplete rows
+
+`status` and `decide_by` are both `NOT NULL` with a CHECK. The existing corpus does not satisfy either.
+Measured 2026-08-17:
+
+| | count |
+|---|---:|
+| `00 Inbox/` items | **715** |
+| no `decide-by:` at all | **248** |
+| no `status:` at all | **130** |
+| distinct `status:` values to collapse into 6 | **73** |
+
+So the migration has to invent a clock for 248 rows and a status for 130, and **neither is derivable**.
+The at-stake rule — 3 days if a named person is waiting or the text names an external date, else 30 —
+turns on a judgment about conversational state that a migration cannot make. The 73 → 6 collapse needs
+a mapping someone writes by hand: `needs-kyle` and `drafting` map themselves, `awaiting-ratify`,
+`diagnosed`, `partial` and `proposal` do not.
+
+**The contract (Kyle, 2026-08-17):**
+
+1. **Default conservatively.** Missing `decide_by` becomes `created + 30 days`; missing or unmapped
+   `status` becomes `drafting`. Never the 3-day tier — a migration inventing urgency is worse than a
+   migration inventing patience.
+2. **Tag every guess.** A `queue.inferred` column holds a comma-separated list of the fields the
+   migration supplied (`decide_by`, `status`), and is `NULL` on any row whose values were authored.
+   `WHERE inferred IS NOT NULL` is then the honest answer to "what did the machine make up."
+3. **Emit one worklist, not 378 prompts.** Phase 6 renders a single ratify file — same shape as the
+   existing `00 Inbox/<date>-vault-maintenance-ratify.md` — listing every tagged row grouped by what
+   was guessed. Kyle marks it in bulk.
+4. **Ratification clears the tag.** Correcting a value, or accepting it explicitly, sets `inferred` to
+   `NULL` for that field. A row that still carries the tag has never been looked at, and that is
+   queryable forever rather than lost in a one-time report.
+5. **The status map is explicit and versioned**, checked into the migration rather than inferred at run
+   time. Anything it does not name lands as `drafting` and tagged, which is how the map gets extended
+   instead of silently widening.
+
+The property this buys: **no row is ever silently assigned a date that implies somebody reviewed it.**
+That is the same failure the 248 clockless items represent today — an item with no clock and an item
+with a machine-assigned clock look identical once the migration finishes, unless the difference is
+recorded in the row.
+
+### 5.4 More than one workspace
 
 `queue` and `runs` carry a `host`. Nothing else does, and the asymmetry is the point: an item and a run
 belong to a workspace, while an event, a commitment and an entity belong to the *operator*. A Gmail
@@ -523,11 +581,53 @@ hash of model output. If a stable ID cannot be derived, **do not emit the event.
 | Slack | `slack:<channel_id>:<ts>` |
 | Jira (assignment/transition) | `jira:<KEY>:changelog:<changelog_id>` |
 | Jira (comment) | `jira:comment:<comment_id>` |
+| Meeting transcript | `transcript:<doc_id>:<turn_index>` — stable per document, never per fetch |
 | Operator capture | `operator:<uuid4>` |
 
 **Commitment extraction is bidirectional.** Scouts must read *sent* mail and the operator's *own*
 Slack messages, not just mentions. Outbound promises are the higher-value half and are invisible to
 a mentions-only sweep.
+
+### 6.2.1 The transcript scout, and the attribution gate it must pass
+
+Meeting transcripts are a fourth source (Kyle, 2026-08-17) — Gemini notes plus third-party Zoom notes
+from EDJ. They are the highest-yield uncaptured commitments, and they carry a defect that makes naive
+extraction worse than no extraction at all.
+
+🔴 **One recording device attributes the whole room to its owner.** When Kyle records a meeting from his
+own device, Gemini labels **every speaker turn** "Kyle Ferran" — the chair, the presenter, everyone. It
+is not Zoom-specific and not detectable from the document title: confirmed 2026-08-13 on the Andrew Sync
+1:1, which had a normal calendar title, a normal invitee list and a scheduled slot, and still labelled
+plainly-Andrew statements as Kyle. Gemini's **"Next steps" inherit the mis-attribution** — on the
+2026-08-06 IRI Baseline Values relaunch, *"establish meeting cadence / distribute a poll"* and
+*"provide dashboard engagement views"* were **Dan Herrick's** and would have landed on Kyle's plate.
+(`.claude/memory/reference_gemini_kyle_records_zoom.md`.)
+
+**Why this is a correctness gate and not a data-quality nuisance.** A commitment carries `direction`
+(`i_owe` / `owed_to_me`) and a `counterparty_id`, both derived from who said what. Under
+mis-attribution those do not degrade — they **invert**. Every promise anyone else made in the room
+becomes a promise Kyle owes, and the §6.5 ladder then nudges him about it up to three times. That is
+the trust collapse §9's cold-start rule exists to prevent, arriving through a different door.
+
+**Required of the transcript scout:**
+
+1. **Compute the speaker distribution before extracting anything.** A transcript attributing ~100% of
+   turns to a single participant in a multi-participant meeting is mis-attributed by definition.
+2. **On a mis-attributed transcript, do not derive `actor` from speaker labels.** Either re-derive
+   attribution from content — self-introductions, who is addressed by name, who is handed the screen
+   share — or emit the events as `kind: fyi` with no commitment extracted. Emitting nothing is a
+   correct outcome; emitting a commitment with an inverted direction is not.
+3. **Gemini's "Next steps" are never a commitment source.** They are a derived summary that inherits
+   whatever the labels got wrong. Commitments come from the transcript body or not at all.
+4. **Varying speaker labels are trustworthy.** A document where labels genuinely differ is a Google Meet
+   recording and its attribution holds; the failure is specific to single-device capture.
+5. **Third-party transcripts (EDJ-owned Zoom) are untrusted content like any other source** — §3.1
+   applies unchanged, and they additionally carry another organization's meeting content, which §7.4's
+   capability inventory must name.
+
+Until the distribution check exists, the transcript scout does not extract commitments. This is the one
+source where the spec's default — extract and let confidence sort it out — produces confidently wrong
+rows rather than low-confidence ones.
 
 **Retractions.** Scouts must read enough thread context to detect a commitment being withdrawn, and
 emit it as `role: retraction` evidence.
@@ -599,10 +699,23 @@ definition, and the recorded rule for human-gated escalations is business hours 
 | Rung | Channel | Content |
 |---|---|---|
 | 1 | Daily note only | Listed under "Coming due" |
-| 2 | Slack DM | Reminder + permalink |
-| 3 | Slack DM | Reminder + `resolve` / `drop` / `snooze` actions |
+| 2 | **In-band** — daily note *and* the escalation register | Reminder + permalink. Lands somewhere with a scheduled reader and a Doctor alarm (§8.2), so it is a real escalation rather than a second line in a note that can be skimmed past |
+| 3 | Slack DM | Reminder + permalink + `resolve` / `drop` / `snooze` actions |
 
 After rung 3 → `stale`. **No commitment is ever nudged a fourth time.**
+
+**Why rung 2 is in-band** (Kyle, 2026-08-17). The original ladder went out of band at rung 2, which sat
+badly against the `CB_PUSH_URL` decision — declined twice on the grounds that the Claude Code app is the
+surface Kyle actually watches. A ladder whose second rung jumps to a channel he did not ask for is
+routing routine reminders out of band and saving nothing for the case that genuinely needs it.
+
+So the ladder escalates *surface* before it escalates *channel*: note → a register that is read and
+alarmed on → out of band, once, immediately before the commitment goes stale. Rung 3 stays Slack because
+by then the in-band path has demonstrably failed twice, which is exactly the condition an out-of-band
+channel exists for.
+
+**This moves B4.** Slack outbound no longer blocks rung 2, so it is not on the Phase 3 critical path —
+only rung 3 needs it, and rung 3 cannot fire until a commitment has survived two earlier nudges.
 
 ### 6.6 Doctor
 
@@ -729,9 +842,26 @@ That last line is a significant safety property. Guard it.
 `~/.claude/history.jsonl` and the landed report files, so storing it is not new; putting full prompts
 and responses in a **queryable store adjacent to `entities` and `commitments`** is. A scout trace
 contains exactly the untrusted prose I7 exists to keep out of decisions, and a Gmail scout trace will
-contain compensation or performance content the first time such a thread is swept. The 30-day TTL
-delays that exposure without scoping it — consider making `traces` opt-in per run rather than
-default-on.
+contain compensation or performance content the first time such a thread is swept, and once transcripts
+land (§6.2.1) it will hold another organization's meeting content too.
+
+**`traces` is default-on and stays that way** (Kyle, 2026-08-17): *"need traces in case there ever is a
+prompt injection attack or I need to audit what was done."* That reframes the table — it is not a
+debugging aid that happens to retain text, it is **the audit surface for the trust boundary**. §3.1 and
+§6.2 exist to stop untrusted prose reaching a decision; `traces` is the only place that records whether
+they did. An injection that was correctly flagged and one that slipped through look identical
+afterwards without it.
+
+Two consequences of it being an audit surface rather than a debugging one:
+
+- **Rows flagged `suspected_injection = 1` are exempt from pruning and retained indefinitely**
+  (Kyle, 2026-08-17). The 30-day TTL is a debugging retention, and an injection discovered in October
+  cannot be investigated against August's traces. The exemption is a one-line predicate on the prune
+  query and leaves the retention story unchanged for everything else — which matters, because the
+  volume that made a TTL necessary is ordinary scout chatter, not the handful of flagged rows.
+- **It is a security control now, so it gets the protection of one.** I1 already covers writes; what it
+  needs additionally is that `prune-traces` cannot be used to destroy evidence selectively. **Pruning is
+  by age only, never by predicate.**
 
 **The two write-control surfaces currently contradict each other, and I9 exists to stop that.**
 `scripts/cerebro/lib/denylist.sh` refuses `CLAUDE.md`, `*/CLAUDE.md`, `profile.md`, `personality.md`,
@@ -775,6 +905,43 @@ measured rather than hypothetical: `cerebro-intake.timer` and an `intake-tick` c
 `eja-3674-clear-stored-relinquishing-data` was claimed twice hours apart. It went unnoticed because the
 manifest did not mention Claude crons at all until 2026-07-29. Re-arming happens once per unit,
 deliberately, with the substrate question already settled.
+
+### 8.1.1 🔴 There is no cutover, and the unit list is the symptom
+
+Kyle, 2026-08-17: *"I would like to migrate to systemd and have cron or manual invocation as a fall
+back."* That settles the substrate and the fallback — it is I8 applied to the existing units as well as
+the new ones. It exposes a hole it does not fill.
+
+**§8 proposes six timers. Five already exist.** `cerebro-brief`, `cerebro-sweep`, `cerebro-digest`,
+`cerebro-doctor`, `cerebro-export` and `cerebro-review` are v2 operations against the v2 store.
+`cerebro.timer`, `cerebro-intake`, `cerebro-watchlist`, `cerebro-env-monitor` and `cerebro-unlanded` are
+v1 operations against `~/.cerebro` and the markdown Inbox. Plus four migrated rituals. Naively that is
+fifteen units, and the spec never says which of them coexist, which merge, and which die.
+
+**The unit count is not the real problem — the missing cutover is.** This spec has twelve phases and no
+phase in which v1 stops. Phase 6 migrates the queue's *data*; nothing migrates the *operations*. So:
+
+- Through Phases 0–5 the two systems necessarily coexist, because v1 is the live system and v2 is being
+  built beside it in a test workspace. That is correct and needs no reconciliation.
+- At Phase 6 the store becomes authoritative for items, and **that is the moment `cerebro-intake` and
+  the v2 sweep are both draining a queue.** One of them has to stop, in the same change.
+- Nothing states what happens to `cerebro-watch.service`, whose classifier and board renderer read
+  `~/.cerebro` directly.
+
+The duplicate-claim incident in §8.1 is the precedent for what happens when this is left implicit: two
+substrates armed against one queue, ~24 claims a day each, and
+`eja-3674-clear-stored-relinquishing-data` claimed twice hours apart.
+
+**What the spec owes:** a per-operation disposition table — for each of the fifteen, whether it is
+v1-retires-at-Phase-6, v2-replaces-it, or both-run-permanently-because-they-do-different-things — plus
+the ordering constraint that **no two units may drain the same queue at any point in the sequence.**
+
+**Deferred to Phase 6 deliberately** (Kyle, 2026-08-17), not overlooked. Writing it now would mean
+deciding the fate of fifteen operations against a v2 that does not exist yet, and several of those rows
+are judgment calls about what is still worth running — judgments that are cheaper and better-informed
+once the replacement is real. The risk of deferring is that Phase 6 arrives and the table gets skipped
+under delivery pressure, so it is written into that phase's acceptance criteria rather than left as a
+note here.
 
 ### 8.2 Gates must reach the operator without a live pane
 
@@ -855,6 +1022,11 @@ path that the Phase-0 spike exercises rather than assumes.
 Two of the three are pure code assertions. Use LLM-as-judge only where code cannot express the
 criterion.
 
+**`evals/commitments/` is Kyle's to supply** (2026-08-17) — ~30 hand-labeled messages. It is the one
+input in Phases 0–4 that nobody else can produce, because labelling what counts as a commitment in his
+own sent mail *is* the judgment being encoded. Two numbers depend on it and have no defensible value
+until it exists: `min_confidence` here, and §6.3's `merge_jaccard`.
+
 **Threshold policy:** `min_confidence` is an output of the eval set, not a config guess. A missed
 commitment is invisible and costly; a false one costs ten seconds to dismiss. Tune recall-favoring.
 
@@ -870,10 +1042,10 @@ collapse. This is the 122-item overdue pile, described precisely.
 | 0b | Repo skeleton, config split, migration runner, host hardening, `SECURITY.md`, `cerebro init`, `env.example`, credential bootstrap, `PreToolUse` hook, `cb-ritual`, the B3 `-p` spike, retirement of the two hourly crons | `cerebro init` on a clean VM with empty creds produces a working empty system; `doctor` exits 0; every ritual runs from systemd, from cron, and by hand |
 | 1 | Schema, registrar, doctor, rejects, traces, entity tables, Scribe sanitizer (unused). Doctor absorbs `cb-guard` | Valid batch ingests; same batch twice → 0 new rows; malformed batch → exit 2, no writes; single malformed event → reject row, others accepted; injection eval green |
 | 2 | Sent-mail scout, egress proxy, run_steps | Real promise appears within one sweep; three consecutive sweeps yield identical row counts; scout cannot reach any non-Google domain |
-| 3 | Commitments, outbox, courier, Slack DM nudges | Promise in Monday's sent mail produces a rung-2 DM Wednesday; `resolve` halts nudges; 4th nudge never fires; kill courier mid-send → retry does not double-send |
+| 3 | Commitments, outbox, courier, the bounded ladder | Promise in Monday's sent mail reaches rung 2 **in-band** on Wednesday — daily note and the escalation register, no Slack needed; `resolve` halts the ladder; the 4th nudge never fires; kill courier mid-send → retry does not double-send. Rung 3's Slack DM is exercised separately once B4 is proven, and is not a gate on this phase. |
 | 4 | Scribe + daily note render | Note renders; hand-edit inside markers survives as `## Reclaimed` + friction row; markdown image in a swept event is defanged on disk; deny list refuses every identity file |
 | 5 | Slack scout, triage rubric, entity clustering | Full sweep coverage; ranking stable across runs; same topic across sources clusters as one item |
-| 6 | **The `queue` migration** — `00 Inbox/` becomes a projection; `development/queue.md` and `development/items/` consolidated in | Every existing item lands with a legal status and a non-null `decide_by`; `cb-intake`, `cb-distill` and `cb-ingest` keep working against the rendered surface |
+| 6 | **The `queue` migration** — `00 Inbox/` becomes a projection; `development/queue.md` and `development/items/` consolidated in | Every existing item lands with a legal status and a non-null `decide_by`; `cb-intake`, `cb-distill` and `cb-ingest` keep working against the rendered surface; **the per-operation disposition table (§8.1.1) is ratified before any unit is armed**, and no two units drain the same queue at any point in the sequence |
 | 7 | **Archivist digestion, propose-then-apply** — §6.7's knowledge sink | Prose lands in the right file after operator approval; a write whose `platform` mismatches the destination's declared scope is refused, not merged; the per-domain cap is enforced at write time rather than by convention |
 | 8 | Chief of staff over Slack, dispatch + queue | Operator hands off a task from a phone |
 | 9 | Session hooks, brief injection via `hookSpecificOutput.additionalContext` | New sessions start oriented without manual briefing |
