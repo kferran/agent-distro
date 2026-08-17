@@ -611,6 +611,54 @@ Alert delivery is edge-triggered and content-deduped, so a standing condition al
 cleared-then-recurring one alerts again. Silent stopping is the characteristic failure of unattended
 systems; Doctor ships in Phase 1, not later.
 
+### 6.7 The knowledge sink
+
+Phase 8's archivist writes here, and the spec has so far treated the destination as "files, handled by
+the existing `cb-distill` / `cb-ingest` path." That is right about the mechanism and wrong about the
+guarantees: the knowledge layer has the same defect as the item layer, measured the same way.
+
+**Every rule governing the knowledge sink is convention-enforced, and every one is being violated at a
+measurable rate.** `02 Areas/platform/CLAUDE.md` is a well-written rules file — a boundary rule
+(code-verifiable claims go to `03 Resources/{ultron,ironman}/capabilities/`, judgment and traps stay in
+the domain wiki), a write shape, and a 12-entry cap per domain. Measured 2026-08-17:
+
+| domain | Knowledge entries at 2026-08-10 | today | cap |
+|---|---:|---:|---:|
+| case-flow | 30 | **35** | 12 |
+| forms | 25 | **31** | 12 |
+| ownership | 16 | **20** | 12 |
+| products | 12 | **17** | 12 |
+| carriers | 7 | 10 | 12 |
+
+The cap was introduced on 2026-08-10 with enforcement defined as *"starts at the next write to each
+file, which merges or promotes as it goes."* In the seven days since, **every domain grew — +23 entries
+total — and `products` crossed from exactly-at-cap to over.** The merge-or-promote step has not fired
+once. Alongside that, 36 `file:line` code references sit in domain wikis that the boundary rule assigns
+to capability docs.
+
+This is the same finding as the 73 `status:` values and the 246 items with no `decide-by:`, in a
+different layer. A rule that a writer must remember to apply is not enforced; it is documented. **I7's
+argument therefore extends past the item store: the knowledge sink needs structure the writer cannot
+skip**, which for the archivist means the cap and the boundary rule are checks that run before a write
+lands, not sentences the writer is trusted to have read.
+
+**Scope is a field, not a folder name.** The same five wikis carry no frontmatter at all — no `scope:`,
+despite the hub convention requiring it — while their content is decisively Ultron/annuity: 120
+`EJA`/`ASD` references, zero mentions of underwriting, and domain names (`annuitant`, `1035`, `GLWB`)
+that are annuity concepts rather than insurance ones. Today that is harmless because only Ultron work
+flows through them. It stops being harmless the first time an Ironman finding is distilled, because
+nothing structural prevents it landing there.
+
+So the archivist resolves a destination from the item's `platform` (§5.1) rather than from a path that
+looks thematically right, and a write whose `platform` does not match the destination's declared scope
+is refused rather than merged. An unscoped destination is a destination the archivist may not write to.
+
+⚠️ Worth stating plainly because it constrains Phase 8: **Ironman's domain set is not a mirror of
+Ultron's.** These five domains are annuity-shaped. Life needs its own taxonomy — underwriting, policy
+servicing — so the sink cannot assume that a domain existing under one platform implies a twin under
+the other. The capability layer already models this correctly with parallel-but-independent
+`03 Resources/ultron/` and `03 Resources/ironman/` trees.
+
 ## 7. Security requirements
 
 ### 7.1 Egress — default deny
@@ -714,11 +762,25 @@ re-propose). What is needed is that a gate reaches the register in the first pla
 
 **The defect this closes.** A gate written to a beacon reaches nobody once the coordinator pane is
 unavailable, and `cb-escalations` — the register that exists to be the durable backstop — does not
-capture those gates at all. Two were stranded during this amendment (`cerebro-bats-12-failures`,
-`eja-3524`) and `--pending` listed neither; the events log records *"deferred 44849s (coordinator pane
+capture those gates at all. The events log records the mechanism: *"deferred 44849s (coordinator pane
 not deliverable) past 300s ceiling; escalation NOT delivered."* No scheduled job reads `--pending`
 either — the only references are `lib/coordinator.sh`, `lib/push.sh`, and a memory entry saying to
 check it every tick. Convention, not code.
+
+**Measured again 2026-08-17 20:50 UTC, and the rate is worse than the first sample.** Six agents sat on
+`needs-input` — `carrier-onboarding-playbook`, `distributor-onboarding-playbook`, `rca-eja-3169`,
+`rca-eja-3819`, `rca-eja-3836`, `rca-eja-4077-funding-block`, all gated within ten seconds of each
+other at 20:00 — plus two `blocked`. `cb-escalations --pending` listed **none of them**. So this is not
+a rare race that two unlucky tasks hit; it is the normal outcome, and the register's hit rate on real
+gates is currently zero.
+
+**A third requirement the first sample did not show: an escalation must carry its slug.** The single
+entry in the register at that moment read `slug: unknown`, with the body
+`"Supervisor escalate (1): rca-asd-1145-attestation-packet-code: > (pre-read)"` — the identifying slug
+present in the prose and absent from the field. A register entry that cannot name which agent is
+waiting is barely better than no entry: it cannot be drained against a ticket, cannot be deduplicated,
+and cannot be routed. **`slug` is `NOT NULL` on any escalation record, and a caller that cannot supply
+one is a bug at the call site rather than an `unknown` row.**
 
 **Required:** `cb-ask` and beacon gates land in `cb-escalations` unconditionally, independent of pane
 delivery, and a daily ritual reads `--pending` so the register has a scheduled reader. Doctor alerts on
