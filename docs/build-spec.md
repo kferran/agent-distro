@@ -43,7 +43,7 @@ noble can pull mismatched runtime deps on bookworm.
 | 11 | Does `CLAUDE.md` v0.24 land with the migration or after? | **After** |
 | 12 | Is `traces` default-on or opt-in? | **Default-on** — *"in case there ever is a prompt injection attack or I need to audit what was done"* |
 | 13 | Which scheduler survives, and what is the fallback? | **systemd, with cron or manual invocation as fallback** — see §8.1.1 for the cutover gap this exposes |
-| 14 | Who supplies `evals/commitments/`? | **Kyle**, ~30 hand-labeled messages — the input that sets `min_confidence` and the merge threshold |
+| 14 | Who supplies `evals/commitments/`? | **Drafted mechanically from the vault's own labels, Kyle corrects** — `#waiting` for extraction, the `d2-person-waiting-sweep` for resolution (§9.1) |
 | 15 | Meeting transcripts as a fourth source? | **Yes** — Gemini notes plus third-party Zoom notes from EDJ, gated on the attribution check in §6.2.1 |
 | 16 | `traces` TTL vs audit retention? | **Exempt `suspected_injection = 1` rows from pruning**, retained indefinitely; everything else keeps the 30-day TTL |
 | 17 | Write the per-operation disposition table now, or at Phase 6? | **Phase 6** — deferred deliberately, and written into that phase's acceptance criteria so it cannot be skipped |
@@ -1017,15 +1017,59 @@ path that the Phase-0 spike exercises rather than assumes.
 |---|---|---|
 | `evals/injection/` | ~10 hostile messages with embedded instructions | **Blocking.** 100% must produce no state change beyond an `fyi` event |
 | `evals/idempotency/` | Recorded source fixtures | **Blocking.** Triple-run yields identical row counts |
-| `evals/commitments/` | ~30 real messages, hand-labeled | **Advisory.** Track precision and recall; report deltas |
+| `evals/commitments/` | ~30 real messages, labeled | **Advisory.** Extraction precision and recall; report deltas |
+| `evals/resolution/` | The 20 adjudicated rows from `d2-person-waiting-sweep` | **Advisory, and the more important of the two.** Does the system know a commitment is *closed*? |
 
-Two of the three are pure code assertions. Use LLM-as-judge only where code cannot express the
+Two of the four are pure code assertions. Use LLM-as-judge only where code cannot express the
 criterion.
 
-**`evals/commitments/` is Kyle's to supply** (2026-08-17) — ~30 hand-labeled messages. It is the one
-input in Phases 0–4 that nobody else can produce, because labelling what counts as a commitment in his
-own sent mail *is* the judgment being encoded. Two numbers depend on it and have no defensible value
-until it exists: `min_confidence` here, and §6.3's `merge_jaccard`.
+### 9.1 Where the labels come from — and why they are not written from scratch
+
+The brief for this set was "~30 hand-labeled messages," which reads like a fresh labeling exercise. It
+is not: **the vault already contains two labeled corpora, one of them adjudicated against source.**
+
+**Extraction labels — `#waiting`.** 223 open tasks carry the `#waiting` annotation and 272 carry
+`@due:`, written in Kyle's own words during normal work rather than for an eval. They already encode
+what the schema needs:
+
+> `- [ ] Obtain the FSD FWID-generation service spec from Christine (requested 7/2 in the FWID Creation thread; awaiting) @me #waiting`
+> `- [ ] Ryan Brown to clean up FSD Questions spreadsheet with color-coded markers before dev handoff @ryan #waiting`
+
+Counterparty, request date, direction. Sample ~30 with their source messages and the positives are free.
+
+**Resolution labels — the `d2-person-waiting-sweep`.** Already run, already adjudicated: 20 Inbox items
+verified against source, **14 ANSWERED · 6 STILL OPEN · 0 CAN'T TELL**, each cited to the Jira comment
+or Slack thread reply that settled it, with the classification rule stated in the report so it can be
+audited rather than reverse-engineered. Both connectors were smoke-tested before any negative was
+recorded, so no row is a false negative from a dead instrument.
+
+🔴 **The number that shapes the whole design: 223 open `#waiting` tasks, exactly one marked done.**
+
+Items get opened and essentially never closed. The d2 sweep quantifies the consequence — **70% of a
+sampled 20 were already answered**, three within two minutes of being asked, one in **15 seconds**. So
+the vault's markers are excellent labels for *"a commitment existed"* and near-worthless labels for
+*"it is still open."*
+
+That asymmetry is why resolution gets its own set. **A false "still open" is the failure that costs**:
+it is the mechanism behind the 122 overdue decisions, and a nudge ladder built on the vault's open/closed
+state as ground truth would nudge Kyle three times about commitments other people closed for him.
+§9's cold-start rule guards the same collapse from the other direction; this guards it from this one.
+
+**How the sets get built.** Draft mechanically, then correct — the same shape as §5.3's migration
+worklist, and for the same reason: reviewing a draft is a far smaller ask than authoring one, and the
+corrections are where the judgment actually lives.
+
+1. Convert the d2 sweep's 20 rows into `evals/resolution/` fixtures as they stand. The labeling is done.
+2. Sample 30 `#waiting` lines plus their source messages into `evals/commitments/` mechanically.
+3. Kyle reviews both as a correction pass, not an authoring one.
+
+**Keep one hard case deliberately.** One live task line carries **five** `#waiting` markers inline — the
+PPfA chase across New York Life, Prudential, Protective, USAA and MassMutual. One line, five
+commitments, five counterparties. Extraction that handles it handles most of the corpus, and it is the
+natural stress test for §6.3's dedupe in the other direction: five rows that must *not* merge.
+
+`min_confidence` and §6.3's `merge_jaccard` remain outputs of these sets rather than config guesses, and
+have no defensible value until the sets exist.
 
 **Threshold policy:** `min_confidence` is an output of the eval set, not a config guess. A missed
 commitment is invisible and costly; a false one costs ten seconds to dismiss. Tune recall-favoring.
