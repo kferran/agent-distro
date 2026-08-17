@@ -1,5 +1,6 @@
 <!--
-Design of record for the host router. Source in the vault:
+Design of record for the host router. PARKED -- see the banner below.
+Source in the vault:
   99 Meta/specs/2026-08-17-cerebro-host-router-design.md
 Vault copy stays authoritative until Phase 0 lands. Do not edit both.
 -->
@@ -10,8 +11,28 @@ Design for the one v2 component with nothing behind it. Everything else in
 the build spec (docs/build-spec.md) assumes an item already knows where it belongs; this
 says how it finds out.
 
-Kyle, 2026-08-17, asking for it: a vault dedicated to Protective on the Life project and a vault
-dedicated to the Annuity project, monitored simultaneously.
+> ## ⏸ Deferred — build one vault, keep the seams
+>
+> Kyle, 2026-08-17: *"Let's start with single vault while I am the single user on this system. As we
+> grow and move into potentially allowing multiple users access this may need to split into multiple
+> vaults."*
+>
+> **Nothing in this document gets built now.** With one vault there is one host, every item routes to
+> it, and a router is a lookup that always returns the same answer. Building it would be machinery
+> without a job.
+>
+> **What stays anyway, because it costs a line each and buys the option:**
+> `queue.host` and `runs.host` (already in the build spec §5.3), and `queue.platform` from §1 below.
+> With one vault every row carries the same `host` and a real `platform` — and `platform` earns its
+> keep immediately, because it is what routes a finding to `03 Resources/ultron/` versus
+> `03 Resources/ironman/` (§4). That distinction is live on day one even with a single vault.
+>
+> **The trigger is multiple users, not vault count** — which matters, because multi-user is a bigger
+> change than multi-vault and hits different tables. See §7.
+
+Original framing, retained because the analysis holds whenever the split happens — Kyle, 2026-08-17:
+a vault dedicated to Protective on the Life project and a vault dedicated to the Annuity project,
+monitored simultaneously.
 
 ## What the router is for, and what it must not do
 
@@ -66,19 +87,56 @@ are real projects today. Those are simply `host = ultron`, `platform = ultron`.
 **Hosts remain mutually exclusive; the axis changed.** Exclusivity is required over *engagements*,
 which genuinely do partition, rather than over the full signal space, which does not.
 
-### 1.1 When does something earn its own vault?
+### 1.1 A partner is not one kind of thing
 
-`Nationwide Single Platform` is the case that needs a rule rather than a ruling, because "etc."
-guarantees more of them. It is either a project inside the Nationwide vault or an engagement of its
-own, and nothing in the signals decides that — it is a statement about how the work is run.
+Kyle, 2026-08-17, on what `Nationwide Single Platform` is: *"an Ironman installation for Nationwide
+directly rather than a distribution group like EDJ, Lion Street or FFR."*
 
-Proposed rule: **an engagement earns a vault when it has its own stakeholders and its own cadence.**
-Shared stakeholders and shared cadence means a project folder inside an existing vault. That keeps the
-vault count tied to how Kyle actually works rather than to how many names exist.
+That is a third axis, and it explains why `Nationwide` appears twice in the same list without either
+entry being a mistake:
 
-⚠️ `Nationwide Single Platform` does not appear anywhere in the vault as a named initiative — the only
-matches for the phrase are incidental prose. So it is either new or shorthand; it needs Kyle to say
-which before it can be routed.
+| Relationship | Who they are | Examples |
+|---|---|---|
+| **Distribution group** | distributes products from many carriers; Porch's platform serves the distributor | EDJ · Lion Street · FFR |
+| **Direct installation** | the carrier runs the platform itself | Nationwide Single Platform |
+| **Carrier as product source** | their products flow through someone else's distribution | Nationwide · Pacific Life · Protective, as they appear in an EDJ or Lion Street context |
+
+So **Nationwide (life, annuities)** and **Nationwide Single Platform** are two different relationships
+with the same company, not a duplicate. One is a carrier whose products flow through distributors; the
+other is a direct Ironman installation.
+
+🔴 **This breaks the key table in §3.2 and the fix is not obvious.** `NW` maps to "nationwide" — but
+which one? A `NW` ticket could be Nationwide-as-carrier work inside a distributor engagement, or
+Nationwide-Single-Platform installation work. The Jira key alone cannot tell them apart, which means
+the "decisive" rating for project key in §3.1 is wrong for at least this partner and probably for any
+carrier that is also a direct installation.
+
+Whoever builds this needs a second signal for those cases — board, component, label, or a separate
+project key if one exists. Until then those items are `unrouted` by rule rather than guessed at. This
+is the single largest open problem in the routing design and it did not surface until Kyle described
+what the vaults actually are.
+
+### 1.2 When does something earn its own vault?
+
+"etc." guarantees more of these, so the rule matters more than any individual ruling.
+
+Proposed: **an engagement earns a vault when it has its own stakeholders and its own cadence.** Shared
+stakeholders and shared cadence means a project folder inside an existing vault. That keeps the vault
+count tied to how Kyle actually works rather than to how many names exist.
+
+### 1.3 What platform vaults hold
+
+Kyle, 2026-08-17: *"Both work and knowledge. Work should mostly come out of Jira, so I guess given
+that this would mostly be knowledge."*
+
+So `host = ultron` and `host = ironman` items exist but are the exception — `platform-hardening`,
+`ultron-e2e-coverage`, `ppfa-extractor-refactor` are the shape. Ticket-derived work almost always
+belongs to an engagement, because a Jira key names a partner board. Platform vaults are predominantly
+knowledge stores that happen to carry a little infrastructure work.
+
+Practical consequence for the router: **if an item's only signal is a partner Jira key, it never routes
+to a platform vault.** Platform-vault items arrive from operator capture or from repo/branch signals on
+platform-infrastructure branches, not from the key table.
 
 ## 2. The `EDJ` trap, which is why this is a table and not an inference
 
@@ -127,7 +185,7 @@ read off the ticket.
 | `BL` | ironman | banner-life |
 | `JH` | ironman | john-hancock |
 | `LFG` | ironman | lincoln |
-| `NW` | ironman | nationwide |
+| `NW` | ironman | nationwide — ⚠️ **ambiguous**, see §1.1: carrier-as-product-source or the direct Single Platform installation. Needs a second signal. |
 | `PL` | ironman | pacific-life |
 | `PML` | ironman | penn-mutual |
 | `PRU` | ironman | prudential |
@@ -230,19 +288,45 @@ Named so nobody reads the router as more than it is:
 1. **`PA` and `PI` are unconfirmed.** `03 Resources/glossary.md` lists them among Life/carrier keys
    without naming the partner. `profile.md` mentions `PA` in a sprint context. Confirm before they are
    in the table, or leave them `unrouted` — which is the safe default and costs only a surfaced item.
-2. **How fine-grained are engagements?** The list has `EDJ (life)` and `EDJ (annuities)` split but
-   `Nationwide (life, annuities)` combined — which the two-field model supports either way, since
-   platform is per-item. The question is which Kyle wants per partner, and §1.1's rule (own
-   stakeholders + own cadence) is the proposed way to decide it once rather than eleven times.
-3. **Is `Nationwide Single Platform` an engagement or a project?** It appears nowhere in the vault, so
-   it needs naming before it can route. If it is an engagement, `Nationwide` must stop matching its
-   tickets — which is the first real test of whether the engagement partition holds in practice.
-4. **Does `SD` belong to a host at all?** It is the platform bucket rather than a carrier. Leaving it
+2. 🔴 **How does a `NW` item split between Nationwide-as-carrier and Nationwide Single Platform?**
+   §1.1. The largest unsolved routing problem, and it generalises to any carrier that is also a direct
+   installation. Needs a second signal — board, component, label — or those items stay `unrouted`.
+3. **Does `SD` belong to a host at all?** It is the platform bucket rather than a carrier. Leaving it
    `unrouted` surfaces it every time, which is either correct or annoying depending on volume.
-5. **Do the platform vaults (Ultron, Ironman) hold work, or only knowledge?** §1 assumes they hold
-   platform-infrastructure items, because `platform-hardening` and `ultron-e2e-coverage` are real
-   projects today. If Kyle would rather those live in an engagement vault, platform vaults become pure
-   knowledge stores and `host = ultron` never appears.
+4. **When the split comes, is it driven by engagements or by users?** §7 argues they are different
+   problems and that the user work dominates. Worth deciding deliberately rather than discovering it.
+
+**Answered 2026-08-17 and recorded so they are not re-asked:** single vault to start, trigger is
+multiple users (banner above) · `Nationwide Single Platform` is a direct Ironman installation, not a
+distribution group (§1.1) · platform vaults hold both work and knowledge, in practice mostly knowledge
+(§1.3).
+
+## 7. Multi-user is a bigger change than multi-vault, and it hits the other tables
+
+Kyle named multiple users as the trigger for splitting vaults. Worth separating the two, because they
+are not the same problem and the vault split is the smaller half.
+
+The build spec deliberately gives `host` to `queue` and `runs` only. `events`, `commitments` and
+`entities` are **operator-scoped** — a Gmail message and a promise to a colleague belong to the person,
+not to a directory. That reasoning is sound for one operator and is exactly what breaks with two.
+
+| Table | Multi-vault | Multi-user |
+|---|---|---|
+| `queue`, `runs` | `host` — done | needs an owner, and a rule for who may claim |
+| `events` | untouched | **whose mailbox?** Two users sweeping the same Slack channel produce the same event twice |
+| `commitments` | untouched | **whose promise?** The nudge ladder targets a person; direction (`i_owe`) is meaningless without knowing who "I" is |
+| `entities` | untouched | `is_self` is a single boolean today |
+| `traces` | untouched | one user's prompts become readable by another |
+
+So the tables that need no change for multi-vault are precisely the ones multi-user rewrites. The
+sequencing follows: **splitting vaults first buys nothing toward multi-user**, and doing the user work
+first makes the vault split mechanical. If the real goal is other people using this, the vault
+question is downstream of it.
+
+Two more that are not schema at all and are easy to miss: `Confidential/` is currently a
+you-do-not-read-it convention enforced by prose and a four-entry deny list, which does not survive a
+second reader; and `~/.cerebro/env` holds one set of credentials, so today every user would act as
+Kyle against Jira and Slack.
 
 ## Provenance
 
