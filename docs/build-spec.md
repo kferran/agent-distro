@@ -3,7 +3,7 @@ GENERATED FILE — DO NOT EDIT.
 
 Source of truth:  00 Inbox/2026-08-16-cerebro-build-spec-v0.2.md
 In:               the vault repo (porch-vault), origin/main
-At commit:        ca514203
+At commit:        88426ccf
 
 Regenerate:       ./scripts/sync-specs.sh
 Detect drift:     ./scripts/sync-specs.sh --check

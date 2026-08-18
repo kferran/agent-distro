@@ -3,7 +3,7 @@ GENERATED FILE — DO NOT EDIT.
 
 Source of truth:  99 Meta/specs/2026-08-17-cerebro-host-router-design.md
 In:               the vault repo (porch-vault), origin/main
-At commit:        ca514203
+At commit:        88426ccf
 
 Regenerate:       ./scripts/sync-specs.sh
 Detect drift:     ./scripts/sync-specs.sh --check
@@ -33,8 +33,11 @@ says how it finds out.
 > keep immediately, because it is what routes a finding to `03 Resources/ultron/` versus
 > `03 Resources/ironman/` (§4). That distinction is live on day one even with a single vault.
 >
-> **The trigger is multiple users, not vault count** — which matters, because multi-user is a bigger
-> change than multi-vault and hits different tables. See §7.
+> **Revisiting is Kyle's call, not a threshold anything trips.** Kyle, 2026-08-18: *"Single vault is the
+> decision for now. Down the road I may revisit multiple vaults."* Multiple users is the most likely
+> prompt and the one that changes the most — it is a bigger change than multi-vault and hits entirely
+> different tables (§7) — but it is not the only reason he might come back to this, and nothing here
+> should read as a gate that opens on its own.
 >
 > ### And the cheaper answer may be that this is never built
 >
