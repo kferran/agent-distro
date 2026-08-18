@@ -1,15 +1,14 @@
 <!--
-Design of record for this repo. Authored by Kyle 2026-08-16, amended 2026-08-17
-against eleven decisions, then consolidated so it reads as a spec rather than a
-decision log.
+GENERATED FILE — DO NOT EDIT.
 
-Provenance and the companion documents live in the vault, not here:
-  00 Inbox/2026-08-16-cerebro-build-spec-v0.2.md            this file's source
-  00 Inbox/2026-08-16-research-cerebro-buildspec-v02-review review + decay check
-  00 Inbox/2026-08-16-research-cerebro-distro-repo-separation  packaging design
+Source of truth:  00 Inbox/2026-08-16-cerebro-build-spec-v0.2.md
+In:               the vault repo (porch-vault), origin/main
+At commit:        83c3a1fa
 
-The vault copy stays authoritative until Phase 0 lands; after that this one is,
-and the vault keeps a pointer. Do not edit both.
+Regenerate:       ./scripts/sync-specs.sh
+Detect drift:     ./scripts/sync-specs.sh --check
+
+Edits made here are lost on the next sync. Edit the vault copy.
 -->
 
 # Cerebro — Build Specification v0.2

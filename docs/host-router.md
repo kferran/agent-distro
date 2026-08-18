@@ -1,17 +1,16 @@
 <!--
-Design of record for the host router. PARKED -- see the banner below.
-Source in the vault:
-  99 Meta/specs/2026-08-17-cerebro-host-router-design.md
-Vault copy stays authoritative until Phase 0 lands. Do not edit both.
+GENERATED FILE — DO NOT EDIT.
+
+Source of truth:  99 Meta/specs/2026-08-17-cerebro-host-router-design.md
+In:               the vault repo (porch-vault), origin/main
+At commit:        83c3a1fa
+
+Regenerate:       ./scripts/sync-specs.sh
+Detect drift:     ./scripts/sync-specs.sh --check
+
+Edits made here are lost on the next sync. Edit the vault copy.
 -->
 
-# Host router — deciding which workspace owns an item
-
-Design for the one v2 component with nothing behind it. Everything else in
-the build spec (docs/build-spec.md) assumes an item already knows where it belongs; this
-says how it finds out.
-
-> ## ⏸ Deferred — build one vault, keep the seams
 # Host router — deciding which workspace owns an item
 
 Design for the one v2 component with nothing behind it. Everything else in
