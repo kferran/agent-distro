@@ -304,5 +304,16 @@ cb_liveness_epoch_end
     printf '\nℹ Auto-resumed (%d)\n' "${#fyi[@]}"
     printf -- '- %s\n' "${fyi[@]}"
   fi
+# A board write must never CREATE the host root. atomic_write mkdir -p's its
+# parent, so before the one-resolver change this silently conjured $HOME/vault
+# on every tick ("cb-board creates that dir on its own default every tick, and
+# always has" — tests/cb-watch.bats). Harmless while the default was a path
+# that existed; not harmless once CB_VAULT actually points where the caller
+# said, because the created directory then satisfies cb-land's `-d "$VAULT"`
+# refusal and a landing lands somewhere nobody meant. Refuse instead.
+if [ ! -d "$CB_VAULT" ]; then
+  echo "cb-board: host root does not exist: $CB_VAULT — refusing to create it" >&2
+  exit 3
+fi
 } | atomic_write "$CB_VAULT/board.md"
 echo "cb-board: wrote $CB_VAULT/board.md"
