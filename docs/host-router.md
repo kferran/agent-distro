@@ -3,7 +3,7 @@ GENERATED FILE — DO NOT EDIT.
 
 Source of truth:  99 Meta/specs/2026-08-17-cerebro-host-router-design.md
 In:               the vault repo (porch-vault), origin/main
-At commit:        83c3a1fa
+At commit:        ca514203
 
 Regenerate:       ./scripts/sync-specs.sh
 Detect drift:     ./scripts/sync-specs.sh --check

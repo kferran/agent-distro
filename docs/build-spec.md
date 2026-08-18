@@ -3,7 +3,7 @@ GENERATED FILE — DO NOT EDIT.
 
 Source of truth:  00 Inbox/2026-08-16-cerebro-build-spec-v0.2.md
 In:               the vault repo (porch-vault), origin/main
-At commit:        83c3a1fa
+At commit:        ca514203
 
 Regenerate:       ./scripts/sync-specs.sh
 Detect drift:     ./scripts/sync-specs.sh --check
@@ -76,6 +76,38 @@ that does not exist**, and it is the capability this build is for.
 
 **Acceptance test for the distro:** a stranger clones the repo, runs `cerebro init` against empty
 credentials, and gets a working, empty system. If that fails, this is a personal hack, not a distro.
+
+### 1.1 What v2 owns, and what it does not
+
+**v2 is a subsystem alongside the existing fleet, not a replacement for it** (Kyle, 2026-08-18). The
+fleet — the coordinator, the X-Men, 37 `cb-*` binaries, the board, 47 skills — keeps running. Read
+literally, §11's *"Markdown as state — the design this replaces"* sounds like a rewrite. It is not one,
+and the distinction is three relationships rather than one word:
+
+| | Relationship | What it means |
+|---|---|---|
+| **Fleet operations** — watch-list polling, env anomaly detection, wave ranking, keeping the coordinator pane alive | **alongside** | v2 has no counterpart and is not trying to have one. These run unchanged, indefinitely. |
+| **Commitments and the nudge ladder** | **pure addition** | Nothing exists to take over. This is the capability the build is for. |
+| **Item state** | **a handover** | Phase 6 makes `queue` authoritative and `00 Inbox/` a projection of it. v2 takes ownership of something the fleet holds today. |
+
+The third is the one "alongside" gets wrong, so it is worth being exact: it *is* a transfer. What keeps
+it from being a rewrite is that `cb-intake`, `cb-distill` and `cb-ingest` **keep working against the
+rendered surface** — they go on reading `00 Inbox/` markdown, and that markdown starts being generated
+from the store instead of hand-maintained. The fleet is not rewritten; the ground under it becomes
+validated.
+
+**Stated plainly: v2 owns item state and commitments. The fleet owns work execution. Neither replaces
+the other.**
+
+⚠️ **The risk in this framing, named so it does not get used as cover.** "Alongside" is comfortable, and
+comfortable framings become reasons not to integrate. Two systems coexisting with overlapping
+responsibilities is precisely how the duplicate-scheduler incident happened — `cerebro-intake.timer` and
+an `intake-tick` cron both claiming from one queue about 24 times a day each, until
+`eja-3674-clear-stored-relinquishing-data` was claimed twice hours apart.
+
+**§8.1.1's disposition table is the control for that**, and its real job is not documentation: it forces
+every job to have exactly one owner. *"Both run permanently"* is a legitimate outcome only where the two
+genuinely do different things, and it is also the answer most easily given lazily.
 
 ## 2. Invariants
 
@@ -872,6 +904,10 @@ allows precisely what `denylist.sh` exists to forbid. The Phase-0 hook imports `
 `allow` list loses the identity files.
 
 ## 8. Scheduling
+
+**These six are additions to the existing scheduler, not replacements for it.** Four live fleet
+operations have no v2 counterpart at all (§1.1), so read this block as "what v2 adds" rather than
+"what the scheduler becomes." Which existing units survive is §8.1.1's table, not this list.
 
 ```
 cerebro-brief.timer      OnCalendar=Mon..Fri 07:00
